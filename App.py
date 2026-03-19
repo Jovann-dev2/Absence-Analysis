@@ -26,12 +26,66 @@ st.caption(
 # Helper Functions for Grouped Average Plot
 # -------------------------------------------
 
-def find_categorical(df, threshold=20):
-    cat_cols = [
-        col for col in df.columns 
-        if df[col].dtype == "object" or df[col].nunique() < threshold
-    ]
-    return cat_cols
+def find_valid_group_cols(
+    df: pd.DataFrame,
+    *,
+    min_unique: int = 2,
+    max_unique: int = 200,
+    exclude: list[str] | None = None,
+) -> list[str]:
+    """
+    Return only columns that are safe and sensible for groupby:
+      - Not in exclude list (metrics/IDs).
+      - Have between [min_unique, max_unique] distinct values.
+      - Values are hashable.
+      - A trial groupby does not raise 'not 1-dimensional' or similar errors.
+    """
+    if exclude is None:
+        exclude = []
+    # Known metrics and typical identifiers to exclude from grouping UI
+    exclude_set = set(exclude) | {
+        "Industry Number",
+        "Absense Occasions",
+        "Absence Occasions",              # in case it appears
+        "Days Absent",
+        "Bradford Score",
+        "Overtime Avg (12 Months)",
+    }
+
+    valid = []
+    for col in df.columns:
+        if col in exclude_set:
+            continue
+
+        s = df[col]
+        # Require at least some variation but not too many levels
+        try:
+            nunique = s.nunique(dropna=True)
+        except Exception:
+            # If nunique itself fails, skip
+            continue
+
+        if nunique < min_unique or nunique > max_unique:
+            continue
+
+        # Ensure values are hashable (list/dict/array-like values will fail)
+        try:
+            # Mapping hash over values will error for unhashable entries
+            pd.Series(s).map(hash)
+        except Exception:
+            continue
+
+        # Trial groupby to see if pandas accepts it as a 1-D grouper
+        try:
+            _ = df.groupby(col, dropna=False).size()
+        except Exception:
+            # This catches the "not 1-dimensional" and other grouping issues
+            continue
+
+        valid.append(col)
+
+    # Keep a stable order (original column order)
+    return [c for c in df.columns if c in valid]
 
 @st.cache_data
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -290,10 +344,18 @@ if exclude_unfit:
         st.warning("Column 'Reporting Discipline' not found; no rows excluded.")
 
 # Keep only the necessary columns; minimize exposure to any extra data
-group_col = st.selectbox(
-        "Choose a grouping column:",
-        find_categorical(df_full),
+group_col_options = find_valid_group_cols(df_full)
+if not group_col_options:
+    st.error(
+        "No valid grouping columns found. Please ensure your file has at least one "
+        "categorical/text column with a reasonable number of distinct values."
     )
+    st.stop()
+
+group_col = st.selectbox(
+    "Choose a grouping column:",
+    group_col_options,
+)
 df = df_full[["Industry Number", "Absense Occasions", "Days Absent", f"{group_col}"]].copy()
 
 # Explicitly discard the broader df to avoid retaining extra columns/PII
