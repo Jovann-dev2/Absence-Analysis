@@ -1,1041 +1,1136 @@
-import re
-import sys
-import streamlit as st
-from pathlib import Path
-import pandas as pd
+import gc
 import numpy as np
-from io import BytesIO
-from uuid import uuid4
+import pandas as pd
+import streamlit as st
+import sys
 import altair as alt
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.formatting.rule import ColorScaleRule
+import sys
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
 
-st.set_page_config(page_title="Unavailability Insights", layout="wide")
+# -------------------------------------------
+# Streamlit Page Config
+# -------------------------------------------
+st.set_page_config(page_title="Absence Analysis", layout="wide")
 
-st.title("🔎 Unavailability Insights")
-st.write(
-    "Upload an appropriate data file below. Unavailability insights will be generated, aggregated by a certain group. "
+st.title("Absence Analysis")
+st.caption(
+    "Upload a CSV with columns: 'Industry Number' (PII), "
+    "'Absense Occasions', 'Days Absent', and 'Group Shaft Name'. "
+    "PII is anonymized immediately."
 )
 
-# ----------------------------
-# Year selection (NEW)
-# ----------------------------
-DEFAULT_YEAR = 2026
-year_str = st.text_input("📅 Year of interest", value=str(DEFAULT_YEAR), help="Enter a 4-digit year (e.g., 2026)")
-try:
-    selected_year = int(year_str)
-    if selected_year < 1900 or selected_year > 2100:
-        raise ValueError
-except Exception:
-    st.warning("Please enter a valid 4-digit year between 1900 and 2100. Using default year 2026.")
-    selected_year = DEFAULT_YEAR
+# -------------------------------------------
+# Helper Functions for Grouped Average Plot
+# -------------------------------------------
 
-OUTPUT_CSV = f"{selected_year}_expiries_by_shaft.csv"
+def find_categorical(df, threshold=20):
+    cat_cols = [
+        col for col in df.columns 
+        if df[col].dtype == "object" or df[col].nunique() < threshold
+    ]
+    return cat_cols
 
-# If you know the exact file name, set it here (e.g., 'data.xlsx').
-# Otherwise leave as None and the script will auto-detect if there is exactly one .xlsx in the folder.
-xlsx_path = st.file_uploader("📤 Upload the appropriate XLSX data file", type=["xlsx"])
-
-file_bytes: bytes | None = None
-if xlsx_path is not None:
-    # Read the uploaded file into bytes; this will be used as the cache key
-    file_bytes = xlsx_path.getvalue()
-
-# ======================================================
-# 🆕 Critical skill designations — fill in your list here
-# ======================================================
-HARD_CODED_CRITICAL_SKILLS: list[str] = [
-    # TODO: Replace/extend with your full official list:
-    "Operator Rock Drill Single Handed UG",
-    "Operator Winch UG",
-    "Operator Loco",
-    "Team Leader Production UG",
-    "Shift Supervisor Production UG",
-    "Miner Stoping",
-    "Miner Development",
-    "Miner General"
-    # "Blaster UG",
-    # ...
-]
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def normalize_text(s: str) -> str:
-    """Lowercase and collapse non-alphanumeric to spaces to make matching robust."""
-    return re.sub(r'[^a-z0-9]+', ' ', str(s).strip().lower()).strip()
-
-def first_header_row(df: pd.DataFrame, min_non_empty: int = 6, max_scan: int = 50) -> int:
+@st.cache_data
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Find the first row that likely contains column names:
-    - Has at least `min_non_empty` non-empty cells.
-    - Scans up to `max_scan` rows.
+    Normalize/standardize column names to match canonical expectations.
+    Supports slight variations like 'Absence' vs 'Absense'.
     """
-    scan_limit = min(len(df), max_scan)
-    for i in range(scan_limit):
-        row = df.iloc[i]
-        non_empty = row.map(lambda x: pd.notna(x) and str(x).strip() != '').sum()
-        if non_empty >= min_non_empty:
-            return i
-    return 0  # fallback
+    # Build a lookup by normalized name (lower, stripped, single-space)
+    def norm(s: str) -> str:
+        return " ".join(str(s).strip().lower().split())
 
-def read_sheet_with_header_detection(xlsx_obj, sheet_name: str) -> pd.DataFrame:
+    normalized_map = {norm(c): c for c in df.columns}
+
+    # Canonical names we want in the final df
+    want = {
+        "industry number": "Industry Number",
+        "absense occasions": "Absense Occasions",  # as specified in the prompt
+        "absence occasions": "Absense Occasions",   # accept common alternative spelling
+        "days absent": "Days Absent",
+        "bradford score": "Bradford Score",
+        "overtime avg (12 months)": "Overtime Avg (12 Months)",
+
+    }
+
+    # Determine which actual columns correspond to the canonical ones
+    rename_from = {}
+    for k, canonical in want.items():
+        if k in normalized_map:
+            rename_from[normalized_map[k]] = canonical
+
+    # Apply renaming where possible
+    df2 = df.rename(columns=rename_from)
+    return df2
+
+def check_required_columns(df: pd.DataFrame):
+    required = ["Industry Number", "Absense Occasions", "Days Absent"]
+    missing = [c for c in required if c not in df.columns]
+    return missing
+
+@st.cache_data
+def anonymize_industry_number(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Read a sheet (xlsx_obj can be a Path, BytesIO, or pd.ExcelFile) without assuming header placement;
-    detect header row and return the data.
+    Replace 'Industry Number' values with sequential integers starting at 1.
+    Does not retain any mapping or the original values.
     """
-    tmp = pd.read_excel(xlsx_obj, sheet_name=sheet_name, header=None, engine='openpyxl')
-    hdr_row = first_header_row(tmp)
-    header = tmp.iloc[hdr_row].astype(str).tolist()
-    df = tmp.iloc[hdr_row + 1:].copy()
-    df.columns = header
-    # Drop rows that are completely empty
-    df = df.dropna(how='all')
+    # Factorize to sequential ids; discard the uniques array afterward
+    codes, uniques = pd.factorize(df["Industry Number"], sort=False)
+    df["Industry Number"] = codes + 1
+
+    # Explicitly drop references to original unique values and trigger GC
+    del uniques
+    gc.collect()
     return df
 
-def find_column(df: pd.DataFrame, targets: list[str]) -> str | None:
+@st.cache_data
+def coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+@st.cache_data
+def aggregate_stats(df: pd.DataFrame, group_col) -> pd.DataFrame:
     """
-    Find a column in df matching any of the normalized `targets`.
-    Matching is exact on normalized text or substring match to be tolerant.
+    Group by group_col and compute mean/median/std for the two numeric measures.
+    Also include a count per group (number of rows contributed).
     """
-    norm_targets = [normalize_text(t) for t in targets]
-    norm_cols = {col: normalize_text(col) for col in df.columns}
+    grouped = df.groupby(group_col, dropna=False)
 
-    # Exact normalized match first
-    for col, ncol in norm_cols.items():
-        if ncol in norm_targets:
-            return col
+    agg_df = grouped.agg({
+        "Absense Occasions": ["mean", "median", "std"],
+        "Days Absent": ["mean", "median", "std"]
+    })
+    # Flatten multiindex columns
+    agg_df.columns = [
+        f"{col[0]}_{col[1]}" for col in agg_df.columns.to_flat_index()
+    ]
 
-    # Then substring match
-    for col, ncol in norm_cols.items():
-        if any(t in ncol for t in norm_targets):
-            return col
+    # Add count per group (size)
+    agg_df["count"] = grouped.size()
 
-    return None
+    # Rename to cleaner column names
+    rename_map = {
+        "Absense Occasions_mean": "avg_absense_occasions",
+        "Absense Occasions_median": "median_absense_occasions",
+        "Absense Occasions_std": "std_absense_occasions",
+        "Days Absent_mean": "avg_days_absent",
+        "Days Absent_median": "median_days_absent",
+        "Days Absent_std": "std_days_absent",
+    }
+    agg_df = agg_df.rename(columns=rename_map)
 
-def parse_dates_series(series: pd.Series) -> pd.Series:
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return series
+    # Optional: sort by avg_days_absent descending
+    agg_df = agg_df.sort_values(by="avg_days_absent", ascending=False)
 
-    parsed = pd.to_datetime(series, errors='coerce')
+    return agg_df.reset_index()
 
-    need_excel = parsed.isna()
-    numeric = pd.to_numeric(series.where(need_excel), errors='coerce')
-    mask_excel = need_excel & numeric.notna() & (numeric.between(20000, 60000))
-    if mask_excel.any():
-        excel_base = pd.Timestamp('1899-12-30')
-        parsed.loc[mask_excel] = excel_base + pd.to_timedelta(numeric.loc[mask_excel], unit='D')
-
-    return parsed
-
-def classify_sheet_with_overrides(
-    df: pd.DataFrame,
-    sheet_name: str
-) -> tuple[str | None, dict]:
+@st.cache_data
+def auto_thin_points(df: pd.DataFrame,
+                     x_col: str,
+                     y_col: str,
+                     weight_col: str = "count") -> pd.DataFrame:
     """
-    FAST PATH:
-      - If the sheet name exists in SHEET_COLUMN_MAP and required columns exist → use it.
-    FALLBACK:
-      - Use automatic detection (existing logic).
+    Automatically reduce points if there are too many or if they are too close.
+    Strategy:
+    - Normalize x/y into [0,1] range.
+    - Dynamic max points cap based on number of groups.
+    - Greedy selection based on 'weight_col' (keep higher weight first).
+    - Enforce a minimum Euclidean distance in normalized space.
     """
 
-    # ----------------------------
-    # ✅ FAST PATH — hard coded
-    # ----------------------------
-    cfg = SHEET_COLUMN_MAP.get(sheet_name)
-
-    if cfg:
-        legal_type = cfg.get("legal_type")
-        col_map: dict = {}
-
-        missing = False
-        for key, col_name in cfg.items():
-            if key == "legal_type":
-                continue
-            if col_name not in df.columns:
-                missing = True
-                break
-            col_map[key] = col_name
-
-        if not missing:
-            st.write(f"⚡ Using hard-coded layout for sheet '{sheet_name}'")
-            return legal_type, col_map
-
-        st.warning(
-            f"⚠️ Sheet '{sheet_name}': hard-coded columns missing — falling back to auto detection."
-        )
-
-    # ----------------------------
-    # 🐢 FALLBACK — automatic detection
-    # ----------------------------
-    group_candidates = ['group shaft name', 'shaft name', 'group name', 'shaft']
-    cof_date_candidates = ['next examination date']
-    wp_date_candidates = ['permit expiry date', 'permit expiry', 'expiry date']
-    al_date_candidates = ['date of last leave', 'last leave date', 'last leave']
-
-    group_col = find_column(df, group_candidates)
-    cof_col = find_column(df, cof_date_candidates)
-    wp_col  = find_column(df, wp_date_candidates)
-    al_col  = find_column(df, al_date_candidates)
-
-    if group_col and cof_col:
-        return 'COF Expiry', {'group': group_col, 'date': cof_col}
-
-    if group_col and al_col:
-        return 'Annual Leave Expiry', {'group': group_col, 'last_leave': al_col}
-
-    if group_col and wp_col and 'permit' in normalize_text(wp_col):
-        return 'Work Permit Expiry', {'group': group_col, 'date': wp_col}
-
-    return None, {}
-
-def month_pivot_counts(df: pd.DataFrame, group_col: str, date_col: str, legal_type: str, year: int) -> pd.DataFrame:
-    """Return counts per month (1–12) for the given legal_type and year, grouped by group_col."""
-    dates = parse_dates_series(df[date_col])
-    valid = df[dates.notna()].copy()
-    valid['_exp_date'] = dates[dates.notna()]
-    valid['_year'] = valid['_exp_date'].dt.year
-    valid['_month'] = valid['_exp_date'].dt.month
-
-    # Keep only the target year
-    valid = valid[valid['_year'] == year]
-
-    # Drop missing groups
-    valid = valid[valid[group_col].notna() & (valid[group_col].astype(str).str.strip() != '')]
-
-    if valid.empty:
-        # Return empty table with correct structure
-        idx = pd.Index([], name='Shaft')
-        cols = list(range(1, 13))
-        pivot = pd.DataFrame(0, index=idx, columns=cols, dtype=int)
-    else:
-        pivot = (
-            valid.groupby([group_col, '_month'])
-                 .size()
-                 .unstack('_month')
-                 .reindex(columns=range(1, 13), fill_value=0)
-        )
-        pivot.index.name = 'Shaft'
-
-    # Add Legal Type level
-    pivot['Legal Type'] = legal_type
-    pivot = pivot.reset_index().set_index(['Shaft', 'Legal Type'])
-    return pivot
-
-def month_pivot_counts_annual_leave(df: pd.DataFrame, group_col: str, last_leave_col: str, legal_type: str, year: int) -> pd.DataFrame:
-    """Compute expiry = last_leave + 18 months, then pivot counts by month for the given year."""
-    last_leave = parse_dates_series(df[last_leave_col])
-    valid = df[last_leave.notna()].copy()
-    valid['_last_leave'] = last_leave[last_leave.notna()]
-    # Add 18 months
-    valid['_exp_date'] = valid['_last_leave'] + pd.DateOffset(months=17)
-    valid['_year'] = valid['_exp_date'].dt.year
-    valid['_month'] = valid['_exp_date'].dt.month
-
-    # Keep only the target year
-    valid = valid[valid['_year'] == year]
-
-    # Drop missing groups
-    valid = valid[valid[group_col].notna() & (valid[group_col].astype(str).str.strip() != '')]
-
-    if valid.empty:
-        idx = pd.Index([], name='Shaft')
-        cols = list(range(1, 13))
-        pivot = pd.DataFrame(0, index=idx, columns=cols, dtype=int)
-    else:
-        pivot = (
-            valid.groupby([group_col, '_month'])
-                 .size()
-                 .unstack('_month')
-                 .reindex(columns=range(1, 13), fill_value=0)
-        )
-        pivot.index.name = 'Shaft'
-
-    pivot['Legal Type'] = legal_type
-    pivot = pivot.reset_index().set_index(['Shaft', 'Legal Type'])
-    return pivot
-
-def discover_input_xlsx(explicit_path: str | None) -> Path:
-    """Find the input xlsx file. If explicit_path is None, auto-detect if exactly one .xlsx exists."""
-    if explicit_path:
-        p = Path(explicit_path)
-        if not p.exists():
-            raise FileNotFoundError(f"File not found: {explicit_path}")
-        return p
-
-    xlsx_files = sorted(Path('.').glob('*.xlsx'))
-    if len(xlsx_files) == 0:
-        raise FileNotFoundError("No .xlsx file found in current directory.")
-    if len(xlsx_files) > 1:
-        files_list = '\n'.join([f" - {f.name}" for f in xlsx_files])
-        raise FileNotFoundError(f"Multiple .xlsx files found. Please set INPUT_XLSX.\n{files_list}")
-    return xlsx_files[0]
-
-# ----------------------------
-# Aggregation helper for custom shaft groupings
-# ----------------------------
-def aggregate_by_custom_groups(df: pd.DataFrame, mapping: dict[str, str], month_cols: list[str]) -> pd.DataFrame:
-    """
-    Aggregate rows by a custom mapping from Shaft -> GroupName.
-    Unmapped shafts retain their original name. Aggregation preserves 'Legal Type'.
-    """
-    if df.empty:
+    n = len(df)
+    if n == 0:
         return df
 
-    tmp = df.copy()
-    tmp['Shaft'] = tmp['Shaft'].astype(str)
-    # New grouped name if mapped, else keep original
-    tmp['_ShaftGrouped'] = tmp['Shaft'].map(mapping).fillna(tmp['Shaft'])
+    # Dynamic heuristics for max points and spacing
+    if n <= 100:
+        max_points = 100
+        min_dist = 0.0           # show all, no thinning
+    elif n <= 500:
+        max_points = 120
+        min_dist = 0.02
+    elif n <= 2000:
+        max_points = 150
+        min_dist = 0.03
+    else:
+        max_points = 200
+        min_dist = 0.04
 
-    # Group and sum monthly numeric columns; recompute Total afterwards
-    grouped = (
-        tmp.drop(columns=['Shaft'])
-           .rename(columns={'_ShaftGrouped': 'Shaft'})
-           .groupby(['Shaft', 'Legal Type'], as_index=False)[month_cols].sum()
-    )
-    grouped['Total'] = grouped[month_cols].sum(axis=1)
+    # Normalize x and y to [0, 1] for distance checks
+    x = df[x_col].astype(float)
+    y = df[y_col].astype(float)
 
-    # Ensure column order and integer types
-    grouped = grouped[['Shaft', 'Legal Type'] + month_cols + ['Total']]
-    for c in month_cols + ['Total']:
-        grouped[c] = pd.to_numeric(grouped[c], errors='coerce').fillna(0).astype(int)
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
 
-    return grouped
+    # avoid divide by zero; if no spread, normalization collapses
+    x_norm = (x - x_min) / (x_max - x_min) if x_max > x_min else pd.Series(0.5, index=df.index)
+    y_norm = (y - y_min) / (y_max - y_min) if y_max > y_min else pd.Series(0.5, index=df.index)
 
-# ======================================================
-# 🆕 Helper to collect all Designation values across sheets
-# ======================================================
-@st.cache_data(show_spinner="🔎 Scanning designations…")
-def get_all_designations(file_bytes: bytes) -> list[str]:
-    xls = pd.ExcelFile(BytesIO(file_bytes), engine='openpyxl')
-    seen: set[str] = set()
-    for sheet in xls.sheet_names:
-        try:
-            raw = read_sheet_with_header_detection(xls, sheet)
-            desig_col = find_column(raw, ['designation'])
-            if desig_col:
-                vals = (
-                    raw[desig_col]
-                    .dropna()
-                    .astype(str)
-                    .map(lambda s: s.strip())
-                )
-                seen.update([v for v in vals if v != ''])
-        except Exception:
+    df_norm = df.copy()
+    df_norm["_xn"] = x_norm
+    df_norm["_yn"] = y_norm
+
+    # Sort by weight descending so we keep the densest / most representative groups first
+    if weight_col in df_norm.columns:
+        df_norm = df_norm.sort_values(by=weight_col, ascending=False)
+    else:
+        df_norm = df_norm.sample(frac=1.0, random_state=42)  # fallback random order
+
+    selected_idx = []
+    selected_coords = []
+
+    # Greedy selection ensuring spacing
+    for idx, row in df_norm.iterrows():
+        if len(selected_idx) >= max_points:
+            break
+
+        xn, yn = row["_xn"], row["_yn"]
+
+        if min_dist <= 0:
+            selected_idx.append(idx)
+            selected_coords.append((xn, yn))
             continue
-    out = sorted(seen)
-    return out
 
-# ======================================================
-# ✅ HARD-CODED SHEET → COLUMN MAP (FAST PATH)
-# Fill this in according to your workbook structure.
-# ======================================================
+        # Check spacing from all previously selected points
+        too_close = False
+        for (sx, sy) in selected_coords:
+            if (xn - sx) ** 2 + (yn - sy) ** 2 < (min_dist ** 2):
+                too_close = True
+                break
 
-SHEET_COLUMN_MAP: dict[str, dict] = {
-    # Sheet name (exact match) : configuration
+        if not too_close:
+            selected_idx.append(idx)
+            selected_coords.append((xn, yn))
+
+    thinned = df_norm.loc[selected_idx].drop(columns=["_xn", "_yn"])
+    return thinned
+
+# -------------------------------------------
+# File Uploader (CSV only)
+# -------------------------------------------
+uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
+
+if uploaded is None:
+    st.info("Please upload a CSV to begin.")
+    st.stop()
+
+# -------------------------------------------
+# Read and limit to only necessary columns early
+# -------------------------------------------
+try:
+    # Read CSV into a temporary df
+    df_full = pd.read_csv(uploaded)
+
+    # Normalize column names to capture minor variations; then keep only needed columns
+    df_full = normalize_columns(df_full)
+    df_full = coerce_numeric(df_full,["Absense Occasions", "Days Absent", "Bradford Score", "Overtime Avg (12 Months)"])
+    missing = check_required_columns(df_full)
+    if missing:
+        st.error(
+            "The uploaded file is missing required columns: "
+            + ", ".join([f"'{m}'" for m in missing])
+        )
+        st.stop()
+except Exception as e:
+    st.stop()
+
+
+
+# >>> NEW: Global exclusion toggle (apply BEFORE any analysis) <<<
+exclude_unfit = st.checkbox(
+    "Exclude employees unfit for work (remove rows where 'Reporting Discipline' contains 'unfit' or 'maternity')",
+    value=False,
+    help="When checked, rows with 'Reporting Discipline' containing 'unfit' or 'maternity' (case-insensitive) are removed from all analyses."
+)
+
+if exclude_unfit:
+    if "Reporting Discipline" in df_full.columns:
+        before_rows = len(df_full)
+
+        # Build masks on the current df_full BEFORE filtering (so we can report what was excluded)
+        rd_series = df_full["Reporting Discipline"].astype(str)
+        mask_exclude = rd_series.str.contains(r"unfit|maternity", case=False, na=False)
+        mask_keep = ~mask_exclude
+
+        # Compute distinct excluded values & their counts (for transparency)
+        # Strip whitespace and drop blank values to keep the list clean
+        excluded_values_counts = (
+            rd_series[mask_exclude]
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .value_counts(dropna=False)
+            .sort_values(ascending=False)
+        )
+
+        # Apply the filter
+        df_full = df_full[mask_keep].copy()
+        removed = before_rows - len(df_full)
+        st.info(f"Excluded {removed:,} row(s) due to Reporting Discipline containing 'unfit' or 'maternity'.")
+
+        # >>> NEW: Expander showing which values were excluded <<<
+        with st.expander("Details: excluded 'Reporting Discipline' values", expanded=False):
+            if excluded_values_counts.empty:
+                st.write("No values were excluded (no matches for 'unfit' or 'maternity').")
+            else:
+                st.caption(
+                    f"Excluded a total of **{int(excluded_values_counts.sum()):,}** row(s) "
+                    f"across **{excluded_values_counts.size:,}** distinct value(s)."
+                )
+                st.dataframe(
+                    excluded_values_counts.rename("rows_excluded").to_frame(),
+                    use_container_width=True
+                )
+    else:
+        st.warning("Column 'Reporting Discipline' not found; no rows excluded.")
+
+# Keep only the necessary columns; minimize exposure to any extra data
+group_col = st.selectbox(
+        "Choose a grouping column:",
+        find_categorical(df_full),
+    )
+df = df_full[["Industry Number", "Absense Occasions", "Days Absent", f"{group_col}"]].copy()
+
+# Explicitly discard the broader df to avoid retaining extra columns/PII
+df_full = anonymize_industry_number(df_full)
+gc.collect()
+
+# --- Count group sizes ---
+group_counts = df[group_col].value_counts().sort_values()
+
+# --- Ask user if small groups should be excluded ---
+st.write("### Group Distribution")
+st.bar_chart(group_counts)
+
+exclude_small = st.checkbox("Exclude groups with a low number of records?", value=False)
+
+if exclude_small:
+    threshold = st.number_input(
+        "Minimum number of records required per group:",
+        min_value=1,
+        max_value=int(group_counts.max()),
+        value=5,
+        step=1,
+    )
     
-    "COF Register": {
-        "legal_type": "COF Expiry",
-        "group": "Group Shaft Name",
-        "date": "Next Examination Date",
-    },
+    # remove groups below threshold
+    valid_groups = group_counts[group_counts >= threshold].index
+    df = df[df[group_col].isin(valid_groups)]
 
-    "Work Permits": {
-        "legal_type": "Work Permit Expiry",
-        "group": "Group Shaft Name",
-        "date": "Permit Expiry Date",
-    },
+    st.success(f"Filtered dataset now includes {len(valid_groups)} groups.")
+    st.write("Remaining groups:", list(valid_groups))
 
-    "Annual Leave": {
-        "legal_type": "Annual Leave Expiry",
-        "group": "Group Shaft Name",
-        "last_leave": "Date of Last Leave",
-    },
-}
+# -------------------------------------------
+# Anonymize PII and enforce numeric types
+# -------------------------------------------
+df = coerce_numeric(df, ["Absense Occasions", "Days Absent"])
+# Optional: show a peek of the anonymized data (no original PII)
+with st.expander("Table Imported (with anonymized PII)", expanded=False):
+    st.dataframe(df_full)
 
-# ======================================================
-# 🆕 Build result with Designation filter
-# ======================================================
-@st.cache_data(show_spinner="🔄 Reading and aggregating workbook…")
-def build_result(
-    file_bytes: bytes,
-    year: int,
-    designation_filter_mode: str,
-    critical_designations_selected: tuple[str, ...],  # tuple to make cache key stable
-) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Heavy step: open the workbook, optionally filter by Designation, classify sheets, build the monthly pivot, and return:
-      - result: DataFrame ready for display/CSV
-      - cols_out: list of month columns (names) + 'Total' for downstream grouping
-    The cache key includes (file_bytes, year, designation_filter_mode, critical_designations_selected).
-    """
-    # Open the workbook once from bytes
-    xls = pd.ExcelFile(BytesIO(file_bytes), engine='openpyxl')
+# -------------------------------------------
+# Aggregate statistics
+# -------------------------------------------
+agg_df = aggregate_stats(df, group_col)
 
-    # Normalized critical set for filtering (only used if mode != Both)
-    crit_norm_set = {normalize_text(x) for x in critical_designations_selected if str(x).strip() != ''}
-    use_filter = designation_filter_mode in {"Critical only", "Non-critical only"}
+st.subheader("Group-level Statistics")
+st.caption(f"Averages, medians, and standard deviations per {group_col}.")
+st.dataframe(agg_df, width='stretch')
 
-    pivots: list[pd.DataFrame] = []
+# -------------------------------------------
+# Scatter Plot: Average Absense Occasions vs Average Days Absent
+# -------------------------------------------
+st.subheader("2D Scatter: Average Absense Occasions vs Average Days Absent")
 
-    # Process each sheet and classify
-    for sheet in xls.sheet_names:
-        try:
-            raw = read_sheet_with_header_detection(xls, sheet)
+plot_df = agg_df[[group_col, "avg_absense_occasions", "avg_days_absent", "count"]].dropna()
 
-            # --- 🆕 Apply Designation filtering if requested ---
-            if use_filter:
-                desig_col = find_column(raw, ['designation'])
-                if desig_col:
-                    desig_norm = raw[desig_col].astype(str).map(normalize_text)
-                    if designation_filter_mode == "Critical only":
-                        raw = raw[desig_norm.isin(crit_norm_set)]
-                    elif designation_filter_mode == "Non-critical only":
-                        raw = raw[~desig_norm.isin(crit_norm_set)]
-                else:
-                    # No Designation column in this sheet; skip filtering for it
-                    pass
+if len(plot_df) == 0:
+    st.info("No points to plot (insufficient or all-null aggregates).")
+    st.stop()
 
-            # If a sheet becomes empty after filtering, skip it early
-            if raw.empty:
-                continue
+# Auto-thin points for readability
+plot_thin = auto_thin_points(
+    plot_df,
+    x_col="avg_absense_occasions",
+    y_col="avg_days_absent",
+    weight_col="count"
+)
 
-            legal_type, cmap = classify_sheet_with_overrides(raw, sheet)
-            if not legal_type:
-                continue
+# Compute overall averages (for reference lines)
+overall_x = plot_df["avg_absense_occasions"].median()
+overall_y = plot_df["avg_days_absent"].median()
 
-            group_col = cmap.get('group')
-            if legal_type in ('COF Expiry', 'Work Permit Expiry'):
-                date_col = cmap.get('date')
-                if date_col is None or group_col is None:
-                    continue
-                piv = month_pivot_counts(raw, group_col, date_col, legal_type, year)
-                pivots.append(piv)
+# Base scatter
+points = (
+    alt.Chart(plot_thin)
+      .mark_circle(size=80, opacity=0.85, color="#2E7D32")
+      .encode(
+          x=alt.X("avg_absense_occasions:Q", title="Average Absense Occasions"),
+          y=alt.Y("avg_days_absent:Q", title="Average Days Absent"),
+          tooltip=[
+              alt.Tooltip(f"{group_col}:N", title="Group"),
+              alt.Tooltip("avg_absense_occasions:Q", title="Avg Absense Occasions", format=".2f"),
+              alt.Tooltip("avg_days_absent:Q", title="Avg Days Absent", format=".2f"),
+              alt.Tooltip("count:Q", title="Records in Group"),
+          ]
+      )
+)
 
-            elif legal_type == 'Annual Leave Expiry':
-                last_leave_col = cmap.get('last_leave')
-                if last_leave_col is None or group_col is None:
-                    continue
-                piv = month_pivot_counts_annual_leave(raw, group_col, last_leave_col, legal_type, year)
-                pivots.append(piv)
-        except Exception as e:
-            print(f"[WARN] Skipping sheet '{sheet}': {e}", file=sys.stderr)
-            continue
+# Vertical line at overall Absense Occasions mean
+vline = (
+    alt.Chart(pd.DataFrame({'x': [overall_x]}))
+      .mark_rule(color='red', strokeDash=[6, 4])
+      .encode(x='x:Q')
+)
 
-    if not pivots:
-        month_cols = list(range(1, 13))
-        result = pd.DataFrame(columns=['Shaft', 'Legal Type'] + month_cols + ['Total'])
-        # Keep a consistent month name list for downstream grouping
-        cols_out = ['January','February','March','April','May','June',
-                    'July','August','September','October','November','December','Total']
-        return result, cols_out
+# Horizontal line at overall Days Absent mean
+hline = (
+    alt.Chart(pd.DataFrame({'y': [overall_y]}))
+      .mark_rule(color='red', strokeDash=[6, 4])
+      .encode(y='y:Q')
+)
 
-    # Combine all pivots
-    combined = pd.concat(pivots, axis=0)
-    combined = combined.groupby(level=[0, 1]).sum()
+# Combine layers
+final_chart = (points + vline + hline).properties(height=500).interactive()
 
-    for m in range(1, 13):
-        if m not in combined.columns:
-            combined[m] = 0
+st.altair_chart(final_chart, width='stretch')
 
-    combined = combined.reindex(columns=list(range(1, 13)), fill_value=0)
-    combined['Total'] = combined.sum(axis=1)
+# -------------------------------------------
+# Group Similarity via Clustering
+# -------------------------------------------
+st.subheader("Statistical Grouping: Merge Close Groups")
 
-    month_map = {
-        1:'January', 2:'February', 3:'March', 4:'April', 5:'May', 6:'June',
-        7:'July', 8:'August', 9:'September', 10:'October', 11:'November', 12:'December'
-    }
-    combined = combined.rename(columns=month_map)
-
-    cols_out = ['January','February','March','April','May','June',
-                'July','August','September','October','November','December','Total']
-
-    result = combined.reset_index()
-    result = result[['Shaft', 'Legal Type'] + cols_out]
-
-    for c in cols_out:
-        result[c] = pd.to_numeric(result[c], errors='coerce').fillna(0).astype(int)
-
-    return result, cols_out
-
-def build_legals_xlsx_bytes(result_like_df: pd.DataFrame, cols_out: list[str], year: int) -> bytes:
-    """
-    Create an Excel file with structure like the provided screenshot:
-      - Title "Legals {year}"
-      - Columns: Shafts | Legal type | January..December | Total
-      - For each Shaft: rows for COF / Work permit / Annual leave (Training excluded)
-      - A "Total planned Expiries" row after each shaft block
-      - Conditional formatting (reds) over monthly values
-    Returns workbook bytes.
-    """
-    # Defensive copy and typing
-    df = result_like_df.copy()
-    if df.empty:
-        # Build an empty template anyway
-        df = pd.DataFrame(columns=['Shaft', 'Legal Type'] + cols_out)
-
-    # Normalize and *exclude training* no matter how it appears
-    def norm(s): 
-        return str(s).strip().lower()
-
-    df['__lt_norm'] = df['Legal Type'].apply(norm)
-    df = df[~df['__lt_norm'].str.contains('train')]  # ignore anything that looks like Training
-
-    # Keep only columns we need in the right order
-    months = cols_out[:-1]  # months only (no 'Total')
-    total_name = cols_out[-1]
-    use_cols = ['Shaft', 'Legal Type'] + months + [total_name]
-    df = df.reindex(columns=use_cols)
-
-    # Make sure numeric
-    for c in months + [total_name]:
-        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
-
-    # Map your data's "Legal Type" values to the display required in the sheet
-    # Your code uses: 'COF Expiry', 'Work Permit Expiry', 'Annual Leave Expiry'
-    display_map = {
-        'cof expiry': 'COF',
-        'work permit expiry': 'Work permit',
-        'annual leave expiry': 'Annual leave',
-    }
-    df['__lt_display'] = df['Legal Type'].apply(lambda s: display_map.get(norm(s), s))
-
-    # We will only include COF / Work permit / Annual leave in this order
-    order_norm = ['cof expiry', 'work permit expiry', 'annual leave expiry']
-
-    # ------------------- Build workbook -------------------
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"Legals {year}"
-
-    # Title (merge across B to last column)
-    header_labels = ['Shafts', 'Legal type'] + months + [total_name]
-    last_col_idx = 1 + len(header_labels)  # 1-based
-    ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=last_col_idx)
-    ws.cell(row=1, column=2).value = f"Legals {year}"
-    ws.cell(row=1, column=2).font = Font(size=14, bold=True)
-    ws.cell(row=1, column=2).alignment = Alignment(horizontal="center")
-
-    # Header row
-    header_row = 2
-    for j, label in enumerate(header_labels, start=1):
-        cell = ws.cell(row=header_row, column=j, value=label)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Column widths
-    ws.column_dimensions['A'].width = 26  # Shafts
-    ws.column_dimensions['B'].width = 16  # Legal type
-    for ci in range(3, last_col_idx + 1):
-        # best-effort; wide enough by default
-        pass
-
-    # Freeze panes below header and to the right of "Legal type"
-    ws.freeze_panes = "C3"
-
-    # Borders
-    thin = Side(border_style="thin", color="DDDDDD")
-
-    # Fill rows
-    row_cursor = header_row + 1
-
-    # Iterate shafts in their current order of appearance
-    for shaft in df['Shaft'].astype(str).fillna('').unique():
-        df_shaft = df[df['Shaft'].astype(str) == shaft]
-
-        # Write 3 rows in the order (COF, Work permit, Annual leave) — Training is NOT included
-        first_row_for_shaft = True
-        for lt_norm in order_norm:
-            sub = df_shaft[df_shaft['Legal Type'].str.lower() == lt_norm]
-
-            # If a type is missing for a shaft, use zeros
-            if sub.empty:
-                values = [0 for _ in months] + [0]
-                lt_display = display_map.get(lt_norm, lt_norm.title())
-            else:
-                # If multiple rows somehow exist (after grouping etc.), sum them
-                summed = sub[months + [total_name]].sum(axis=0)
-                values = [int(summed[m]) for m in months] + [int(summed[total_name])]
-                lt_display = sub['__lt_display'].iloc[0]
-
-            # Shaft name only on the first row of the block
-            ws.cell(row=row_cursor, column=1, value=shaft if first_row_for_shaft else "")
-            ws.cell(row=row_cursor, column=2, value=lt_display)
-
-            # Write months + total
-            for j, m in enumerate(months + [total_name], start=3):
-                ws.cell(row=row_cursor, column=j, value=values[j - 3])
-                ws.cell(row=row_cursor, column=j).number_format = '0'
-
-            # Style row borders lightly
-            for j in range(1, last_col_idx + 1):
-                ws.cell(row=row_cursor, column=j).border = Border(top=thin, bottom=thin, left=thin, right=thin)
-
-            first_row_for_shaft = False
-            row_cursor += 1
-
-        # Totals row for this shaft (sum across the three rows we just wrote)
-        # Compute directly from df_shaft (safer if some types were absent)
-        tot_series = (
-            df_shaft[df_shaft['Legal Type'].str.lower().isin(order_norm)][months + [total_name]]
-            .sum(axis=0)
-        )
-        tot_vals = [int(tot_series[m]) for m in months] + [int(tot_series[total_name])]
-
-        ws.cell(row=row_cursor, column=1, value="Total planned Expiries")
-        ws.cell(row=row_cursor, column=1).font = Font(bold=True)
-        ws.cell(row=row_cursor, column=2, value="")  # empty "Legal type" cell
-
-        for j, m in enumerate(months + [total_name], start=3):
-            ws.cell(row=row_cursor, column=j, value=tot_vals[j - 3])
-            ws.cell(row=row_cursor, column=j).font = Font(bold=True)
-            ws.cell(row=row_cursor, column=j).number_format = '0'
-
-        # Light fill for the totals row (optional)
-        for j in range(1, last_col_idx + 1):
-            ws.cell(row=row_cursor, column=j).fill = PatternFill("solid", fgColor="F4F4F5")
-            ws.cell(row=row_cursor, column=j).border = Border(top=thin, bottom=thin, left=thin, right=thin)
-
-        row_cursor += 1  # next block starts after this row
-
-    last_data_row = row_cursor - 1
-
-    # Conditional formatting (reds) across month cells (C3 : last_col x last_data_row)
-    if last_data_row >= 3:
-        cf_range = f"C3:{ws.cell(row=last_data_row, column=last_col_idx).coordinate}"
-        ws.conditional_formatting.add(
-            cf_range,
-            ColorScaleRule(
-                start_type='min', start_color='FFFAFA',   # very light
-                mid_type='percentile', mid_value=50, mid_color='FCA5A5',  # light red
-                end_type='max', end_color='DC2626'  # deep red
-            )
-        )
-
-    # Pack to bytes
-    from io import BytesIO
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-# ----------------------------
-# Main
-# ----------------------------
-def main(file_bytes: bytes | None):
-    if not file_bytes:
-        st.info("Please upload an XLSX file to begin.")
-        return
-
-    # ======================================================
-    # 🆕 UI: Designation (Critical Skills) filter
-    # ======================================================
-    st.subheader("🎯 Designation Filter (Critical Skills)")
-    mode = st.selectbox(
-        "Which designations should be included?",
-        options=["Both (no filter)", "Critical only", "Non-critical only"],
-        index=0,
-        help="Apply a filter based on the 'Designation' column if present in your sheets."
+# Attempt to import scikit-learn for K-Means and silhouette
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import silhouette_score
+    SKLEARN_OK = True
+except Exception as _e:
+    SKLEARN_OK = False
+    st.warning(
+        "scikit-learn is not available; K-Means clustering requires scikit-learn. "
+        "Please install/repair scikit-learn to enable this feature."
     )
 
-    # Collect all dataset designations to drive UI/defaults
-    dataset_designations = get_all_designations(file_bytes)
-
-    # Defaults: any hard-coded critical designations that are present in the dataset
-    defaults_from_hardcoded = sorted(
-        set(dataset_designations) & set(HARD_CODED_CRITICAL_SKILLS)
+if SKLEARN_OK:
+    # -----------------------------
+    # Sidebar controls
+    # -----------------------------
+    st.sidebar.subheader("K-Means Clustering (Auto-k via Silhouette)")
+    k_min, k_max = st.sidebar.slider(
+        "Range of k (clusters) to try",
+        min_value=2, max_value=15, value=(2, 8), step=1,
+        help="We will fit K-Means for each k in this range and choose the best silhouette score."
+    )
+    standardize = st.sidebar.checkbox(
+        "Standardize features (recommended)",
+        value=True,
+        help="Scale features to zero-mean/unit-variance so neither dominates."
+    )
+    weight_by_count = st.sidebar.checkbox(
+        "Weight by number of records in group",
+        value=True,
+        help="Give more influence to groups with more employee records."
+    )
+    min_n_per_group = st.sidebar.number_input(
+        "Minimum records per group to include",
+        min_value=1, max_value=1000, value=5, step=1,
+        help="Groups with fewer rows than this are excluded from clustering."
+    )
+    random_state = st.sidebar.number_input(
+        "Random seed (reproducibility)",
+        min_value=0, max_value=10_000, value=42, step=1
+    )
+    n_init = st.sidebar.number_input(
+        "n_init (K-Means restarts)",
+        min_value=1, max_value=100, value=10, step=1,
+        help="Number of times K-Means will run with different centroid seeds."
+    )
+    show_sil_details = st.sidebar.checkbox(
+        "Show silhouette details", value=False,
+        help="Display silhouette score by k and a small diagnostic chart."
     )
 
-    selected_critical: list[str] = []
-    if mode != "Both (no filter)":
-        st.caption("Select the **critical designations** below. Defaults include your hard-coded items that are present in the data.")
-        selected_critical = st.multiselect(
-            "Critical designations",
-            options=dataset_designations,
-            default=defaults_from_hardcoded,
-            help="These will be treated as 'critical'."
-        )
-        extra = st.text_input(
-            "Add additional critical designations (comma/semicolon/newline separated, optional)",
-            value="",
-            placeholder="e.g., Specialist XYZ; Senior Blaster UG"
-        )
-        if extra.strip():
-            extras = [s.strip() for s in re.split(r'[,\n;]+', extra) if s.strip()]
-            selected_critical = sorted(set(selected_critical) | set(extras))
+    # -----------------------------
+    # Prepare group-level features
+    # -----------------------------
+    # Expect agg_df to exist with columns:
+    # [group_col, "avg_absense_occasions", "avg_days_absent", "count"]
+    features_df = agg_df[[
+        group_col, "avg_absense_occasions", "avg_days_absent", "count"
+    ]].copy()
 
-    # Build a cache-stable tuple for the selected critical designations
-    selected_critical_tuple = tuple(sorted(set(selected_critical), key=lambda s: s.lower()))
+    # Exclude small groups from clustering, but keep them in mapping as "Excluded"
+    eligible_mask = features_df["count"] >= min_n_per_group
+    eligible_df = features_df.loc[eligible_mask].reset_index(drop=True)
+    excluded_df = features_df.loc[~eligible_mask].reset_index(drop=True)
 
-    # Map display text to internal mode values
-    mode_internal = {
-        "Both (no filter)": "Both",
-        "Critical only": "Critical only",
-        "Non-critical only": "Non-critical only",
-    }[mode]
+    if len(eligible_df) < 2:
+        st.info("Not enough eligible groups (need at least 2) to run clustering.")
+    else:
+        # Features: two dimensions (avg_absense_occasions, avg_days_absent)
+        X = eligible_df[["avg_absense_occasions", "avg_days_absent"]].values
 
-    # Use the cached heavy computation (now includes designation filter parameters)
-    result, cols_out = build_result(
-        file_bytes=file_bytes,
-        year=selected_year,
-        designation_filter_mode=mode_internal,
-        critical_designations_selected=selected_critical_tuple
-    )
-
-    # Save and show the base (un-grouped) result
-    result.to_csv(OUTPUT_CSV, index=False)
-    st.dataframe(result, width='stretch')
-
-    # ----------------------------
-    # Optional custom groupings UI (progressive add/remove)
-    # ----------------------------
-    st.subheader("🧩 Optional: Group 'Shaft' names into custom groups")
-    grouping_choice = st.radio(
-        "Do you want to form groupings of shaft names (for comprehensiveness)?",
-        options=["No", "Yes"], horizontal=True
-    )
-
-    result_to_show = result.copy()
-    output_name = OUTPUT_CSV
-
-    if grouping_choice == "Yes" and not result.empty:
-        shafts = sorted(result['Shaft'].astype(str).dropna().unique().tolist())
-
-        # Reset group definitions when the uploaded data (shafts list) changes
-        if "shafts_signature" not in st.session_state or st.session_state.shafts_signature != tuple(shafts):
-            st.session_state.shafts_signature = tuple(shafts)
-            st.session_state.group_defs = []  # clear any stale group definitions
-
-        # Initialize the container for group definitions in session state
-        if "group_defs" not in st.session_state:
-            st.session_state.group_defs = []
-
-        def add_group():
-            """Append a new empty group with a unique ID."""
-            st.session_state.group_defs.append({
-                "id": str(uuid4()),
-                "name": f"Group {len(st.session_state.group_defs) + 1}",
-                "members": []
-            })
-
-        st.caption("Create a group, then add as many more as you need. You can also remove groups.")
-
-        exclude_ungrouped = st.checkbox(
-            "Exclude ungrouped shafts",
-            value=False,
-            help="When enabled, only shafts that are assigned to a group will be included in the aggregated results."
-        )
-
-        # If there are no groups yet, offer to create the first one
-        if not st.session_state.group_defs:
-            st.info("No groups yet. Click below to create your first group.")
-            st.button("➕ Add first group", on_click=add_group)
-
-        # Render all groups (if any)
-        to_remove_idx = None
-        for idx, g in enumerate(st.session_state.group_defs):
-            with st.expander(f"Group {idx + 1} configuration", expanded=(idx == 0)):
-                # Editable group name
-                name = st.text_input(
-                    f"Name for group {idx + 1}",
-                    value=g["name"],
-                    key=f"group_name_{g['id']}"
-                )
-
-                # Members selection
-                label_for_members = f"Select shaft names for '{name or g['name']}'"
-                members = st.multiselect(
-                    label_for_members,
-                    options=shafts,
-                    default=g["members"],
-                    key=f"group_members_{g['id']}"
-                )
-
-                # Persist current values back to session state
-                g["name"] = name
-                g["members"] = members
-
-                # Row of small action buttons for this group
-                c1, c2, _ = st.columns([1, 1, 6])
-                with c1:
-                    if st.button("🗑️ Remove group", key=f"remove_group_{g['id']}"):
-                        to_remove_idx = idx
-                with c2:
-                    # Quick-add a new group right after this one
-                    if st.button("➕ Add another group", key=f"add_group_after_{g['id']}"):
-                        add_group()
-
-        # Apply removal (if requested) and rerun to keep keys stable
-        if to_remove_idx is not None:
-            st.session_state.group_defs.pop(to_remove_idx)
-            st.rerun()
-
-        # Global add button at the bottom (available once at least one group exists)
-        if st.session_state.group_defs:
-            st.button("➕ Add another group", on_click=add_group, key="add_group_bottom")
-
-        # --- Build mapping & detect conflicts across all groups ---
-        conflict_tracker: dict[str, str] = {}
-        for g in st.session_state.group_defs:
-            group_name = g["name"] or "Unnamed Group"
-            for s in g["members"]:
-                if s in conflict_tracker and conflict_tracker[s] != group_name:
-                    conflict_tracker[s] = "__CONFLICT__"
-                else:
-                    conflict_tracker[s] = group_name
-
-        conflicts = [s for s, v in conflict_tracker.items() if v == "__CONFLICT__"]
-        if conflicts:
-            st.error(
-                "The following shafts are assigned to multiple groups. "
-                "Please resolve the overlaps:\n\n- " + "\n- ".join(sorted(conflicts))
-            )
+        # Optional standardization
+        if standardize:
+            scaler = StandardScaler()
+            X_proc = scaler.fit_transform(X)
         else:
-            # mapping = shaft -> group_name
-            mapping = {s: grp for s, grp in conflict_tracker.items()}
+            X_proc = X
 
-            if mapping:
-                # If exclude_ungrouped is enabled, keep only rows whose Shaft is mapped
-                if exclude_ungrouped:
-                    filtered = result[result["Shaft"].astype(str).isin(mapping.keys())].copy()
-                    # cols_out includes 'Total' at the end; monthly columns are cols_out[:-1]
-                    result_to_show = aggregate_by_custom_groups(filtered, mapping, month_cols=cols_out[:-1])
-                    output_name = OUTPUT_CSV.replace(".csv", "_grouped_exclusive.csv")
-                    st.success("✅ Custom grouping applied (ungrouped shafts excluded). The table below shows the aggregated results.")
+        # Cap k range to the number of eligible samples
+        max_k_possible = max(2, min(k_max, len(eligible_df)))
+        min_k_possible = max(2, min(k_min, max_k_possible))
+        if (min_k_possible, max_k_possible) != (k_min, k_max):
+            st.warning(
+                f"Adjusted k-range to ({min_k_possible}, {max_k_possible}) due to number of eligible groups "
+                f"({len(eligible_df)})."
+            )
+
+        # Sample weights (by group size) if selected
+        sample_w = eligible_df["count"].values if weight_by_count else None
+
+        # -----------------------------
+        # Search k with silhouette
+        # -----------------------------
+        sil_rows = []
+        best_k = None
+        best_sil = -1.0
+        best_km = None
+        best_labels = None
+
+        for k_try in range(min_k_possible, max_k_possible + 1):
+            # Fit K-Means
+            km = KMeans(
+                n_clusters=k_try,
+                random_state=int(random_state),
+                n_init=int(n_init)
+            )
+            try:
+                if sample_w is not None:
+                    km.fit(X_proc, sample_weight=sample_w)
                 else:
-                    result_to_show = aggregate_by_custom_groups(result, mapping, month_cols=cols_out[:-1])
-                    output_name = OUTPUT_CSV.replace(".csv", "_grouped.csv")
-                    st.success("✅ Custom grouping applied. The table below shows the aggregated results.")
-            else:
-                if exclude_ungrouped:
-                    st.info("No shafts were assigned to any group. With exclusion enabled, nothing to show. Disable exclusion or add groups.")
-                    # Show an empty frame with the same columns to avoid errors
-                    result_to_show = result.head(0).copy()
-                else:
-                    st.info("No shafts were assigned to any group. Showing the original results.")
+                    km.fit(X_proc)
+            except TypeError:
+                # Older scikit-learn may not support sample_weight; fallback
+                if sample_w is not None:
+                    st.warning("Your scikit-learn build does not support sample_weight for K-Means. Fitting without weights.")
+                km.fit(X_proc)
 
-    # ----------------------------
-    # Save & display
-    # ----------------------------
-    st.dataframe(result_to_show, width='stretch')
+            labels_try = km.labels_.astype(int)
 
-    # ----------------------------
-    # 🔥 Heat map of the final table (NEW)
-    # ----------------------------
-    st.subheader("🔥 Monthly Heat Map per Shaft Group")
-    if result_to_show.empty:
-        st.info("No data available to display the heat map.")
-    else:
-        month_names = cols_out[:-1]  # exclude 'Total'
-        # Tidy format
-        tidy = result_to_show.melt(
-            id_vars=['Shaft', 'Legal Type', 'Total'],
-            value_vars=month_names,
-            var_name='Month',
-            value_name='Count'
-        )
-        tidy['Month'] = pd.Categorical(tidy['Month'], categories=month_names, ordered=True)
-        tidy['Row Label'] = tidy['Shaft'].astype(str) + " – " + tidy['Legal Type'].astype(str)
+            # Compute silhouette on the processed features (silhouette_score has no sample_weight)
+            # Requires at least 2 clusters and not all points in a single cluster (guaranteed by KMeans if k <= n_samples)
+            try:
+                sil = float(silhouette_score(X_proc, labels_try, metric="euclidean"))
+            except Exception as _e:
+                sil = float("nan")
 
-        heat = (
-            alt.Chart(tidy)
-            .mark_rect()
-            .encode(
-                x=alt.X('Month:O', sort=month_names, title="Month"),
-                y=alt.Y('Row Label:N', title="Shaft – Legal Type"),
-                color=alt.Color('Count:Q', title="Count", scale=alt.Scale(scheme='reds')),
-                tooltip=[
-                    alt.Tooltip('Shaft:N'),
-                    alt.Tooltip('Legal Type:N'),
-                    alt.Tooltip('Month:N'),
-                    alt.Tooltip('Count:Q')
-                ]
-            )
-            .properties(height=min(28 * max(1, tidy['Row Label'].nunique()), 800), width='container')
-        )
-        st.altair_chart(heat, width='stretch')
+            sil_rows.append({"k": k_try, "silhouette": sil})
 
-    # ----------------------------
-    # 📈 Time series plot for chosen year (NEW)
-    # ----------------------------
-    st.subheader(f"📈 Time Series – {selected_year}")
-    if result_to_show.empty:
-        st.info("No data available to display the time series.")
-    else:
-        month_names = cols_out[:-1]
-        tidy = result_to_show.melt(
-            id_vars=['Shaft', 'Legal Type', 'Total'],
-            value_vars=month_names,
-            var_name='Month',
-            value_name='Count'
-        )
-        tidy['Month'] = pd.Categorical(tidy['Month'], categories=month_names, ordered=True)
-        tidy['Series'] = tidy['Shaft'].astype(str) + " – " + tidy['Legal Type'].astype(str)
+            # Track best (break ties by smaller k)
+            if np.isfinite(sil) and (sil > best_sil or (np.isclose(sil, best_sil) and (best_k is None or k_try < best_k))):
+                best_sil = sil
+                best_k = k_try
+                best_km = km
+                best_labels = labels_try
 
-        shafts_all = sorted(result_to_show['Shaft'].astype(str).unique().tolist())
-        # Default to top 5 shafts by total for readability
-        top_by_total = (
-            result_to_show[['Shaft', 'Total']]
-            .groupby('Shaft', as_index=False).sum()
-            .sort_values('Total', ascending=False)['Shaft']
-            .astype(str)
-            .tolist()
-        )
-        default_shafts = top_by_total[:5] if top_by_total else []
+        sil_df = pd.DataFrame(sil_rows).sort_values("k").reset_index(drop=True)
 
-        legal_all = sorted(result_to_show['Legal Type'].astype(str).unique().tolist())
-
-        c_opts, c_chart = st.columns([1, 2], gap="medium")
-        with c_opts:
-            selected_shafts = st.multiselect(
-                "Groups/Shafts to plot",
-                options=shafts_all,
-                default=default_shafts,
-                help="Select which groups/shafts to show on the chart."
-            )
-            selected_legal = st.multiselect(
-                "Expiry type(s)",
-                options=legal_all,
-                default=legal_all,
-                help="Filter by type of expiry (e.g., COF, Work Permit, Annual Leave)."
-            )
-
-        # Filter and build series
-        filtered = tidy[
-            tidy['Shaft'].astype(str).isin(selected_shafts) &
-            tidy['Legal Type'].astype(str).isin(selected_legal)
-        ].copy()
-
-        if filtered.empty:
-            c_chart.info("Adjust your filters—there’s no data for the current selection.")
+        if best_k is None or best_km is None or best_labels is None:
+            st.info("Could not determine a valid number of clusters from silhouette scores.")
         else:
-            line = (
-                alt.Chart(filtered)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X('Month:O', sort=month_names, title="Month"),
-                    y=alt.Y('Count:Q', title="Monthly Count"),
-                    color=alt.Color('Series:N', title="Series (Shaft – Legal Type)"),
-                    tooltip=[
-                        alt.Tooltip('Shaft:N'),
-                        alt.Tooltip('Legal Type:N'),
-                        alt.Tooltip('Month:N'),
-                        alt.Tooltip('Count:Q')
-                    ]
-                )
-                .properties(width='container', height=420)
-            )
-            c_chart.altair_chart(line, width='stretch')
+            st.success(f"Selected k = {best_k} (silhouette = {best_sil:.3f})")
 
-    # ======================================================
-    # 🟥 NEW SECTION — TOTAL EXPIRIES (ALL LEGAL TYPES)
-    # ======================================================
+            # Assign labels for eligible groups
+            label_names = {i: f"Cluster {i+1}" for i in range(best_k)}
+            eligible_df["Overall Grouping"] = [label_names[i] for i in best_labels]
 
-    st.header("📊 Total Expiries per Month (Summed Across All Legal Types)")
+            # Mark excluded groups
+            if len(excluded_df) > 0:
+                excluded_df["Overall Grouping"] = "Excluded (Too few records)"
 
-    if result_to_show.empty:
-        st.info("No data available to calculate total expiries.")
-    else:
-        # ----------------------------
-        # Aggregate totals per Shaft/Group
-        # ----------------------------
-        month_names = cols_out[:-1]  # Months only, not "Total"
-        totals_only = (
-            result_to_show
-            .groupby("Shaft")[month_names]
-            .sum()
-            .reset_index()
-        )
+            # Combine back for mapping & plotting
+            mapping_df = pd.concat(
+                [eligible_df, excluded_df],
+                axis=0, ignore_index=True
+            )[[group_col, "Overall Grouping", "avg_absense_occasions", "avg_days_absent", "count"]]
 
-        st.subheader("📋 Totals Table")
-        st.dataframe(totals_only, width='stretch')
-
-        # ----------------------------
-        # 🔥 Heat Map (Totals Only)
-        # ----------------------------
-        st.subheader("🔥 Risk Heat Map (Totals Only)")
-
-        tidy_totals = totals_only.melt(
-            id_vars="Shaft",
-            value_vars=month_names,
-            var_name="Month",
-            value_name="Count"
-        )
-        tidy_totals["Month"] = pd.Categorical(tidy_totals["Month"], categories=month_names, ordered=True)
-
-        heat_tot = (
-            alt.Chart(tidy_totals)
-            .mark_rect()
-            .encode(
-                x=alt.X("Month:O", sort=month_names, title="Month"),
-                y=alt.Y("Shaft:N", title="Shaft/Group"),
-                color=alt.Color("Count:Q", scale=alt.Scale(scheme="reds"), title="Total Expiries"),
-                tooltip=["Shaft", "Month", "Count"]
-            )
-            .properties(
-                width="container",
-                height=min(30 * len(totals_only), 800)
-            )
-        )
-
-        st.altair_chart(heat_tot, width='stretch')
-
-        # ----------------------------
-        # 📈 Time Series (Totals Only)
-        # ----------------------------
-        st.subheader("📈 Time Series of Total Expiries")
-
-        shafts_available = sorted(totals_only["Shaft"].unique().tolist())
-        default_shaft_selection = shafts_available[:5]
-
-        left_filt, right_plot = st.columns([1, 2])
-
-        with left_filt:
-            selected_shaft_totals = st.multiselect(
-                "Select Shaft(s)/Group(s)",
-                options=shafts_available,
-                default=default_shaft_selection,
+            # --- Ensure consistent dtypes for mapping_df ---
+            # Coerce text columns to str; fill NaNs so downstream UI is stable.
+            mapping_df[group_col] = (
+                mapping_df[group_col]
+                .astype(str)  # convert mixed types to string
+                .str.strip()
+                .replace({"nan": ""})  # if NaN became 'nan'
             )
 
-        if not selected_shaft_totals:
-            right_plot.info("Please select at least one shaft.")
-        else:
-            filtered = tidy_totals[tidy_totals["Shaft"].isin(selected_shaft_totals)]
-
-            line_tot = (
-                alt.Chart(filtered)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("Month:O", sort=month_names),
-                    y=alt.Y("Count:Q", title="Total Expiries"),
-                    color=alt.Color("Shaft:N", title="Shaft/Group"),
-                    tooltip=["Shaft", "Month", "Count"]
-                )
-                .properties(width="container", height=420)
+            mapping_df["Overall Grouping"] = (
+                mapping_df["Overall Grouping"]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": ""})
             )
 
-            right_plot.altair_chart(line_tot, width='stretch')
-
-    # =============================
-    # ⬇️ Download: Excel like the screenshot (ignore Training)
-    # =============================
-    st.subheader("⬇️ Download Excel — Legals layout")
-    if result_to_show.empty:
-        st.info("No data available to export.")
-    else:
-        try:
-            xlsx_bytes = build_legals_xlsx_bytes(result_to_show, cols_out, selected_year)
-            st.download_button(
-                label=f"Download Legals {selected_year} (XLSX)",
-                data=xlsx_bytes,
-                file_name=f"Legals_{selected_year}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            # -----------------------------
+            # Output mapping table
+            # -----------------------------
+            st.markdown("### Overall Grouping Membership (K-Means, Auto-k via Silhouette)")
+            st.dataframe(
+                mapping_df.sort_values(["Overall Grouping", group_col]).reset_index(drop=True),
                 width='stretch'
             )
-        except Exception as ex:
-            st.error(f"Could not build the Excel file: {ex}")
 
-if __name__ == "__main__":
-    main(file_bytes)
+            # -----------------------------
+            # (Optional) Silhouette diagnostics
+            # -----------------------------
+            if show_sil_details and len(sil_df) > 0:
+                with st.expander("Silhouette details", expanded=False):
+                    st.dataframe(
+                        sil_df.style.format({"silhouette": "{:.3f}"}),
+                        width='stretch'
+                    )
+                    try:
+                        sil_chart = (
+                            alt.Chart(sil_df)
+                              .mark_line(point=True)
+                              .encode(
+                                  x=alt.X("k:Q", title="k (number of clusters)"),
+                                  y=alt.Y("silhouette:Q", title="Silhouette score"),
+                                  tooltip=[alt.Tooltip("k:Q"), alt.Tooltip("silhouette:Q", format=".3f")]
+                              )
+                              .properties(height=260)
+                              .interactive()
+                        )
+                        st.altair_chart(sil_chart, width='stretch')
+                    except Exception:
+                        pass
+
+            # -----------------------------
+            # Scatter by cluster (same look & feel)
+            # -----------------------------
+            st.markdown("### Scatter by Overall Grouping")
+            plot_groups = mapping_df.copy()
+
+            # Auto-thin to keep chart readable (assumes auto_thin_points exists)
+            plot_groups_thin = auto_thin_points(
+                plot_groups.rename(columns={
+                    "avg_absense_occasions": "x",
+                    "avg_days_absent": "y"
+                }),
+                x_col="x", y_col="y", weight_col="count"
+            ).rename(columns={"x": "avg_absense_occasions", "y": "avg_days_absent"})
+
+            color_field = alt.Color("Overall Grouping:N", title="Overall Grouping")
+            points2 = (
+                alt.Chart(plot_groups_thin)
+                  .mark_circle(size=90, opacity=0.85)
+                  .encode(
+                      x=alt.X("avg_absense_occasions:Q", title="Average Absense Occasions"),
+                      y=alt.Y("avg_days_absent:Q", title="Average Days Absent"),
+                      color=color_field,
+                      tooltip=[
+                          alt.Tooltip(f"{group_col}:N", title="Group"),
+                          alt.Tooltip("Overall Grouping:N"),
+                          alt.Tooltip("avg_absense_occasions:Q", title="Avg Absense Occasions", format=".2f"),
+                          alt.Tooltip("avg_days_absent:Q", title="Avg Days Absent", format=".2f"),
+                          alt.Tooltip("count:Q", title="Records in Group"),
+                      ]
+                  )
+                  .properties(height=520)
+                  .interactive()
+            )
+
+            # Global mean lines
+            overall_x = plot_groups["avg_absense_occasions"].median()
+            overall_y = plot_groups["avg_days_absent"].median()
+            vline2 = alt.Chart(pd.DataFrame({'x': [overall_x]})).mark_rule(color='red', strokeDash=[6,4]).encode(x='x:Q')
+            hline2 = alt.Chart(pd.DataFrame({'y': [overall_y]})).mark_rule(color='red', strokeDash=[6,4]).encode(y='y:Q')
+
+            st.altair_chart(points2 + vline2 + hline2, width='stretch')
+
+            # -----------------------------
+            # Download mapping
+            # -----------------------------
+            with st.expander("Download Overall Grouping Membership"):
+                st.download_button(
+                    label="Download group-to-overall-group mapping (CSV)",
+                    data=mapping_df.sort_values(["Overall Grouping", f"{group_col}"]).to_csv(index=False),
+                    file_name=f"overall_groupings_kmeans_k{best_k}.csv",
+                    mime="text/csv",
+                )
+
+# ---------------------------------------------
+# Per-Cluster / Per-Group Distribution Viewer
+# ---------------------------------------------
+st.markdown("## Distribution Explorer: Days Absent & Absense Occasions")
+
+# Guardrails for required data
+required_cols_ind = {f"{group_col}", "Days Absent", "Absense Occasions"}
+required_cols_map = {f"{group_col}", "Overall Grouping"}
+
+if not required_cols_ind.issubset(set(df.columns)) or not required_cols_map.issubset(set(mapping_df.columns)):
+    st.info("Required columns not found to build distribution plots. "
+            "Please ensure 'df' has individual-level 'Days Absent' and 'Absense Occasions' "
+            f"and 'mapping_df' contains '{group_col}' and 'Overall Grouping'.")
+else:
+    select_mode = st.radio(
+        "View by",
+        options=["Cluster", "Single Group"],
+        index=0,
+        help="Choose a K-Means cluster or a specific group."
+    )
+
+    # Build choices
+    cluster_choices = sorted([c for c in mapping_df["Overall Grouping"].unique()
+                              if c.startswith("Cluster")])
+    group_choices = sorted(mapping_df[f"{group_col}"].unique())
+
+    if select_mode == "Cluster":
+        if len(cluster_choices) == 0:
+            st.warning("No clusters available. Run clustering first.")
+        else:
+            st.caption("Select a cluster to view its duration distribution.")
+
+            picked_cluster = st.selectbox(
+                "Choose a cluster:",
+                cluster_choices,
+            )
+
+            # Groups inside the chosen cluster
+            groups_in_cluster = mapping_df.loc[
+                mapping_df["Overall Grouping"] == picked_cluster, f"{group_col}"
+            ].unique().tolist()
+
+            st.caption(f"Selected **{picked_cluster}** · {len(groups_in_cluster)} group(s)")
+            filt_groups = groups_in_cluster
+
+    else:
+        st.caption("Select a group to view its duration distribution.")
+
+        picked_group = st.selectbox(
+            "Choose a group:",
+            group_choices,
+        )
+        st.caption(f"Selected **{picked_group}**")
+        filt_groups = [picked_group]
+
+    # Histogram options
+    bins = st.slider("Number of histogram bins", min_value=10, max_value=80, value=30, step=1)
+    opacity = 0.8
+
+    # --- Build individual-level subset from df_full so we can include Bradford & Overtime ---
+    # Start with group column + all four potential metrics
+    needed_cols = [f"{group_col}", "Days Absent", "Absense Occasions",
+                   "Bradford Score", "Overtime Avg (12 Months)"]
+    present_cols = [c for c in needed_cols if c in df_full.columns]
+
+    sub = (
+        df_full.loc[df_full[f"{group_col}"].isin(filt_groups), present_cols]
+               .copy()
+    )
+
+    # Coerce present numeric cols
+    for c in ["Days Absent", "Absense Occasions", "Bradford Score", "Overtime Avg (12 Months)"]:
+        if c in sub.columns:
+            sub[c] = pd.to_numeric(sub[c], errors="coerce")
+
+    # Drop rows that are completely NaN across the four metrics (keep rows if at least one metric exists)
+    metric_cols = [c for c in ["Days Absent", "Absense Occasions", "Bradford Score", "Overtime Avg (12 Months)"] if c in sub.columns]
+    if len(metric_cols) == 0:
+        st.info("No metric columns available to plot.")
+    else:
+        sub = sub.dropna(subset=metric_cols, how="all")
+
+    n_rows = len(sub)
+    if n_rows == 0:
+        st.info("No individual-level rows found for the current selection.")
+    else:
+        # Utility: histogram builder (unchanged except now reusable)
+        def hist_chart(df_in: pd.DataFrame, value_col: str, title: str):
+            import numpy as np
+            vals = df_in[value_col].dropna().values
+            if vals.size == 0 or np.all(vals == vals[0]):
+                # Handle degenerate case
+                return alt.Chart(pd.DataFrame({value_col: vals if vals.size else [0]})).mark_text(
+                    text="Insufficient variation to plot"
+                ).properties(height=260)
+
+            vmin, vmax = float(np.min(vals)), float(np.max(vals))
+            if vmin == vmax:
+                vmin -= 0.5
+                vmax += 0.5
+
+            base = alt.Chart(pd.DataFrame({value_col: vals}))
+            hist = (
+                base.mark_bar(opacity=opacity)
+                    .encode(
+                        x=alt.X(f"{value_col}:Q",
+                                bin=alt.Bin(extent=[vmin, vmax], maxbins=bins),
+                                title=title),
+                        y=alt.Y("count():Q", title="Count"),
+                        tooltip=[
+                            alt.Tooltip(f"{value_col}:Q", title=title, format=".2f"),
+                            alt.Tooltip("count():Q", title="Count")
+                        ]
+                    )
+            )
+            return hist.properties(height=300)
+
+        # --- Build the four charts (only for columns that are present) ---
+        charts = []
+        titles = {
+            "Days Absent": "Days Absent",
+            "Absense Occasions": "Absense Occasions",
+            "Bradford Score": "Bradford Score",
+            "Overtime Avg (12 Months)": "Overtime Avg (12 Months)",
+        }
+
+        # Existing two
+        if "Days Absent" in sub.columns:
+            charts.append(hist_chart(sub, "Days Absent", titles["Days Absent"]))
+        if "Absense Occasions" in sub.columns:
+            charts.append(hist_chart(sub, "Absense Occasions", titles["Absense Occasions"]))
+
+        # NEW two
+        if "Bradford Score" in sub.columns:
+            charts.append(hist_chart(sub, "Bradford Score", titles["Bradford Score"]))
+        if "Overtime Avg (12 Months)" in sub.columns:
+            charts.append(hist_chart(sub, "Overtime Avg (12 Months)", titles["Overtime Avg (12 Months)"]))
+
+        # Layout: render sequentially (Streamlit will stack them)
+        st.markdown("### Distributions")
+        for ch in charts:
+            st.altair_chart(ch, width='stretch')
+
+        # Small numeric summary over whichever metrics are present
+        with st.expander("Summary stats for current selection", expanded=False):
+            def summarize(col):
+                s = sub[col].dropna()
+                if s.empty:
+                    return pd.DataFrame({"metric": ["count","mean","std","min","25%","50%","75%","max"], col: [0, *[float("nan")]*7]})
+                return pd.DataFrame({
+                    "metric": ["count", "mean", "std", "min", "25%", "50%", "75%", "max"],
+                    col: [
+                        int(s.count()),
+                        float(s.mean()),
+                        float(s.std(ddof=1)) if s.count() > 1 else float("nan"),
+                        float(s.min()),
+                        float(s.quantile(0.25)),
+                        float(s.quantile(0.50)),
+                        float(s.quantile(0.75)),
+                        float(s.max()),
+                    ]
+                })
+
+            # Merge summaries for all present metric columns
+            summary = None
+            for c in ["Days Absent", "Absense Occasions", "Bradford Score", "Overtime Avg (12 Months)"]:
+                if c in sub.columns:
+                    summary = summarize(c) if summary is None else summary.merge(summarize(c), on="metric")
+
+            if summary is not None:
+                st.dataframe(
+                    summary.style.format({
+                        "Days Absent": "{:.2f}",
+                        "Absense Occasions": "{:.2f}",
+                        "Bradford Score": "{:.2f}",
+                        "Overtime Avg (12 Months)": "{:.2f}",
+                    }),
+                    width='stretch'
+                )
+
+# -------------------------------------------
+# Correlation Heat Map (Absense, Days, Bradford, Overtime)
+# -------------------------------------------
+st.subheader("Correlation Heat Map")
+
+# Determine which of the extra columns exist in the uploaded data
+corr_candidates = [
+    "Absense Occasions",
+    "Days Absent",
+    "Bradford Score",
+    "Overtime Avg (12 Months)",
+]
+available_cols = [c for c in corr_candidates if c in df_full.columns]
+
+if len(available_cols) < 3:
+    st.info(
+        "To show a meaningful correlation matrix, we need at least 3 of the following columns: "
+        "'Absense Occasions', 'Days Absent', 'Bradford Score', 'Overtime Avg (12 Months)'. "
+        f"Currently found: {', '.join(available_cols) if available_cols else 'none'}"
+    )
+else:
+    # Choose correlation method
+    corr_method = st.selectbox(
+        "Correlation method",
+        options=["pearson", "spearman", "kendall"],
+        index=0,
+        help=(
+            "Pearson: linear correlation (default). "
+            "Spearman: rank correlation (robust to non-linear monotonic relations). "
+            "Kendall: rank correlation (more conservative on small samples)."
+        ),
+    )
+
+    # Work on a safe copy; coerce to numeric
+    corr_df = df_full[available_cols].copy()
+    for c in available_cols:
+        corr_df[c] = pd.to_numeric(corr_df[c], errors="coerce")
+
+    # Drop rows where all are NaN (keeps rows where at least one value exists)
+    corr_df = corr_df.dropna(how="all")
+
+    # If too few valid rows, abort
+    min_rows = 3  # correlation needs at least a few non-null rows
+    if len(corr_df.dropna(how="any")) < min_rows and corr_method == "pearson":
+        st.warning(
+            "Not enough fully non-null rows to compute Pearson correlation reliably. "
+            "Try 'Spearman' or 'Kendall', or ensure data completeness."
+        )
+
+    # Compute correlation matrix on columns pairwise (pandas handles pairwise NaNs)
+    try:
+        corr_mat = corr_df.corr(method=corr_method)
+    except Exception as e:
+        st.error(f"Could not compute correlation: {e}")
+        corr_mat = None
+
+    if corr_mat is None or corr_mat.empty:
+        st.info("No correlation matrix could be computed from the available data.")
+    else:
+        # Prepare for Altair heat map (melt to long form)
+        corr_long = (
+            corr_mat.reset_index()
+                    .melt(id_vars="index", var_name="Variable 2", value_name="Correlation")
+                    .rename(columns={"index": "Variable 1"})
+        )
+
+        # Force categorical order to keep a square grid in a consistent order
+        order = available_cols  # use the same order as columns were found
+        corr_long["Variable 1"] = pd.Categorical(corr_long["Variable 1"], categories=order, ordered=True)
+        corr_long["Variable 2"] = pd.Categorical(corr_long["Variable 2"], categories=order, ordered=True)
+
+        # Build Altair heat map with labels
+        base = alt.Chart(corr_long)
+
+        heat = (
+            base.mark_rect()
+                .encode(
+                    x=alt.X("Variable 1:O", title="", sort=order),
+                    y=alt.Y("Variable 2:O", title="", sort=order),
+                    color=alt.Color(
+                        "Correlation:Q",
+                        scale=alt.Scale(domain=[-1, 0, 1], range=["#b2182b", "#f7f7f7", "#2166ac"]),
+                        legend=alt.Legend(title="Correlation")
+                    ),
+                    tooltip=[
+                        alt.Tooltip("Variable 1:N"),
+                        alt.Tooltip("Variable 2:N"),
+                        alt.Tooltip("Correlation:Q", format=".2f")
+                    ]
+                )
+                .properties(height=360)
+        )
+
+        # Text annotations on top of the heat cells
+        text = (
+            base.mark_text(baseline='middle')
+                .encode(
+                    x=alt.X("Variable 1:O", sort=order),
+                    y=alt.Y("Variable 2:O", sort=order),
+                    text=alt.Text("Correlation:Q", format=".2f"),
+                    color=alt.condition(
+                        alt.datum.Correlation >= 0.5,
+                        alt.value("white"),  # high positive -> white text
+                        alt.value("black")   # else black text
+                    )
+                )
+        )
+
+        st.caption(f"Correlation method: **{corr_method.capitalize()}**")
+        st.altair_chart((heat + text), width='stretch')
+
+# -------------------------------------------
+# Segmented Correlation Heat Maps (by Cluster or by Group)
+# -------------------------------------------
+st.markdown("### Segmented Correlation Heat Maps")
+
+# Helper to build a correlation heat map for a subset DataFrame
+def _corr_heat_for_subset(sub_df: pd.DataFrame, title: str):
+    # Ensure we only use the numeric candidates you already identified
+    if len(available_cols) < 3:
+        st.info(f"'{title}': need at least 3 numeric columns to compute correlation.")
+        return
+
+    sub = sub_df[available_cols].copy()
+    for c in available_cols:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+
+    # Drop rows that are entirely NaN across the columns, as done in the overall heat map
+    sub = sub.dropna(how="all")
+
+    # If too few valid rows, warn but still try (Spearman/Kendall can work with partial NaNs pairwise)
+    min_rows = 3
+    if len(sub.dropna(how="any")) < min_rows and corr_method == "pearson":
+        st.warning(
+            f"'{title}': Not enough fully non-null rows to compute Pearson reliably. "
+            "Spearman or Kendall may be more robust."
+        )
+
+    try:
+        cm = sub.corr(method=corr_method)
+    except Exception as e:
+        st.warning(f"'{title}': could not compute correlation ({e}).")
+        return
+
+    if cm is None or cm.empty:
+        st.info(f"'{title}': correlation matrix is empty.")
+        return
+
+    # Melt to long form for Altair
+    corr_long = (
+        cm.reset_index()
+          .melt(id_vars="index", var_name="Variable 2", value_name="Correlation")
+          .rename(columns={"index": "Variable 1"})
+    )
+
+    # Keep a stable order across charts
+    order = available_cols
+    corr_long["Variable 1"] = pd.Categorical(corr_long["Variable 1"], categories=order, ordered=True)
+    corr_long["Variable 2"] = pd.Categorical(corr_long["Variable 2"], categories=order, ordered=True)
+
+    base = alt.Chart(corr_long)
+
+    heat = (
+        base.mark_rect()
+            .encode(
+                x=alt.X("Variable 1:O", title="", sort=order),
+                y=alt.Y("Variable 2:O", title="", sort=order),
+                color=alt.Color(
+                    "Correlation:Q",
+                    scale=alt.Scale(domain=[-1, 0, 1], range=["#b2182b", "#f7f7f7", "#2166ac"]),
+                    legend=alt.Legend(title="Correlation")
+                ),
+                tooltip=[
+                    alt.Tooltip("Variable 1:N"),
+                    alt.Tooltip("Variable 2:N"),
+                    alt.Tooltip("Correlation:Q", format=".2f")
+                ]
+            )
+            .properties(height=320)
+    )
+
+    text = (
+        base.mark_text(baseline='middle')
+            .encode(
+                x=alt.X("Variable 1:O", sort=order),
+                y=alt.Y("Variable 2:O", sort=order),
+                text=alt.Text("Correlation:Q", format=".2f"),
+                color=alt.condition(
+                    alt.datum.Correlation >= 0.5,
+                    alt.value("white"),
+                    alt.value("black")
+                )
+            )
+    )
+
+    st.markdown(f"**{title}**")
+    st.altair_chart(heat + text, width='stretch')
+
+# User chooses segmentation mode
+seg_mode = st.radio(
+    "Show correlations by:",
+    options=["Cluster", "Group"],
+    index=0,
+    horizontal=True,
+    help="Pick 'Cluster' to see heat maps per K-Means cluster; or 'Group' to see them per group."
+)
+
+# ----------------------
+# Segment by Cluster
+# ----------------------
+if seg_mode == "Cluster":
+    # Require clustering output
+    if "mapping_df" not in locals() or mapping_df is None or "Overall Grouping" not in mapping_df.columns:
+        st.info("No clustering results available. Run the K-Means section above to assign clusters first.")
+    else:
+        # Which clusters to show
+        cluster_list = (
+            mapping_df["Overall Grouping"]
+            .dropna()
+            .astype(str)
+            .sort_values()
+            .unique()
+            .tolist()
+        )
+
+        if len(cluster_list) == 0:
+            st.info("No clusters found to display.")
+        else:
+            chosen_clusters = st.multiselect(
+                "Clusters to display:",
+                options=cluster_list,
+                default=cluster_list[: min(3, len(cluster_list))],
+                help="Select one or more clusters. Use fewer selections for faster rendering."
+            )
+
+            if len(chosen_clusters) == 0:
+                st.info("Pick at least one cluster.")
+            else:
+                # Render each cluster in its own tab
+                tabs = st.tabs(chosen_clusters)
+                for tab, clus in zip(tabs, chosen_clusters):
+                    with tab:
+                        groups_in_cluster = (
+                            mapping_df.loc[mapping_df["Overall Grouping"] == clus, group_col]
+                            .dropna()
+                            .astype(str)
+                            .unique()
+                            .tolist()
+                        )
+                        seg_df = df_full[df_full[group_col].astype(str).isin(groups_in_cluster)].copy()
+                        st.caption(f"{clus} · {len(groups_in_cluster)} group(s) · {len(seg_df)} row(s)")
+                        _corr_heat_for_subset(seg_df, title=f"{clus}")
+
+# ----------------------
+# Segment by Group
+# ----------------------
+else:
+    # All groups from the current dataset
+    group_list = (
+        df_full[group_col]
+        .dropna()
+        .astype(str)
+        .sort_values()
+        .unique()
+        .tolist()
+    )
+
+    if len(group_list) == 0:
+        st.info("No groups found to display.")
+    else:
+        # Let user pick multiple groups (tabs keep it readable)
+        default_selection = group_list[: min(5, len(group_list))]
+        chosen_groups = st.multiselect(
+            "Groups to display:",
+            options=group_list,
+            default=default_selection,
+            help="Select one or more groups. Use fewer for faster rendering."
+        )
+
+        if len(chosen_groups) == 0:
+            st.info("Pick at least one group.")
+        else:
+            tabs = st.tabs([str(g) for g in chosen_groups])
+            for tab, g in zip(tabs, chosen_groups):
+                with tab:
+                    seg_df = df_full[df_full[group_col].astype(str) == str(g)].copy()
+                    st.caption(f"Group: {g} · {len(seg_df)} row(s)")
+                    _corr_heat_for_subset(seg_df, title=f"Group: {g}")
