@@ -1,4 +1,3 @@
-openpyxl
 plotly
 scikit-learn
 streamlit
