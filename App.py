@@ -156,7 +156,7 @@ def sanitize_text_column(series: pd.Series) -> pd.Series:
 def get_grouping_candidates(
     df: pd.DataFrame,
     min_unique: int = 2,
-    max_unique: int = 300,
+    max_unique: int = 450,
 ) -> list[str]:
     """
     Return sensible grouping columns:
