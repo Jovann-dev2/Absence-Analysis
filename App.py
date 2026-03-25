@@ -96,6 +96,15 @@ class ClusterConfig:
     n_init: int
 
 
+@dataclass(frozen=True)
+class IndividualClusterConfig:
+    k_min: int
+    k_max: int
+    standardize: bool
+    random_state: int
+    n_init: int
+
+
 # =========================================================
 # Utility functions
 # =========================================================
@@ -550,7 +559,6 @@ def run_kmeans_clustering(
     eligible_df = features.loc[eligible_mask].reset_index(drop=True)
     excluded_df = features.loc[~eligible_mask].reset_index(drop=True)
 
-    # Need at least 3 groups for silhouette-based model selection
     if len(eligible_df) < 3:
         return None, None, None, None
 
@@ -600,7 +608,9 @@ def run_kmeans_clustering(
 
         silhouette_rows.append({"k": k, "silhouette": score})
 
-        if np.isfinite(score) and (score > best_score or (np.isclose(score, best_score) and (best_k is None or k < best_k))):
+        if np.isfinite(score) and (
+            score > best_score or (np.isclose(score, best_score) and (best_k is None or k < best_k))
+        ):
             best_k = k
             best_score = score
             best_labels = labels
@@ -623,11 +633,7 @@ def run_kmeans_clustering(
 
 def run_individual_kmeans_clustering(
     df_group: pd.DataFrame,
-    k_min: int = 2,
-    k_max: int = 6,
-    standardize: bool = True,
-    random_state: int = 42,
-    n_init: int = 10,
+    config: IndividualClusterConfig,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None, int | None, float | None]:
     """
     Cluster individual records within a single selected group using:
@@ -648,15 +654,15 @@ def run_individual_kmeans_clustering(
 
     X = work_df[[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]].to_numpy(dtype=float)
 
-    if standardize:
+    if config.standardize:
         scaler = StandardScaler()
         X_proc = scaler.fit_transform(X)
     else:
         X_proc = X
 
     n_samples = len(work_df)
-    min_k = max(2, k_min)
-    max_k = min(k_max, n_samples - 1)
+    min_k = max(2, config.k_min)
+    max_k = min(config.k_max, n_samples - 1)
 
     if min_k > max_k:
         return None, None, None, None
@@ -669,8 +675,8 @@ def run_individual_kmeans_clustering(
     for k in range(min_k, max_k + 1):
         model = KMeans(
             n_clusters=k,
-            random_state=random_state,
-            n_init=n_init,
+            random_state=config.random_state,
+            n_init=config.n_init,
         )
         model.fit(X_proc)
         labels = model.labels_.astype(int)
@@ -682,7 +688,9 @@ def run_individual_kmeans_clustering(
 
         silhouette_rows.append({"k": k, "silhouette": score})
 
-        if np.isfinite(score) and (score > best_score or (np.isclose(score, best_score) and (best_k is None or k < best_k))):
+        if np.isfinite(score) and (
+            score > best_score or (np.isclose(score, best_score) and (best_k is None or k < best_k))
+        ):
             best_k = k
             best_score = score
             best_labels = labels
@@ -790,18 +798,133 @@ def render_dataset_overview(df: pd.DataFrame, group_col: str) -> None:
 
 
 # =========================================================
+# Sidebar controls
+# =========================================================
+st.sidebar.header("Data Options")
+
+anonymize_ids = st.sidebar.checkbox(
+    "Anonymize Industry Number values on load",
+    value=True,
+    help="If selected, Industry Number values will be replaced with sequential integers. If not selected, original values are retained.",
+)
+
+st.sidebar.header("Clustering Options")
+
+show_clustering_parameters = st.sidebar.checkbox(
+    "Edit clustering parameters",
+    value=False,
+    help="Show advanced clustering parameters in the sidebar. If not selected, default clustering parameters are used.",
+)
+
+# Default clustering settings
+group_cluster_k_range = (2, 8)
+group_cluster_standardize = True
+group_cluster_weight_by_count = True
+group_cluster_min_records = 5
+group_cluster_random_state = 42
+group_cluster_n_init = 10
+
+individual_cluster_k_range = (2, 6)
+individual_cluster_standardize = True
+individual_cluster_random_state = 42
+individual_cluster_n_init = 10
+
+if show_clustering_parameters:
+    st.sidebar.markdown("### Group Clustering Parameters")
+    group_cluster_k_range = st.sidebar.slider(
+        "Group clustering k-range",
+        min_value=2,
+        max_value=15,
+        value=(2, 8),
+        help="K-Means will be run for each k in this range, and the best silhouette score will be selected.",
+    )
+    group_cluster_standardize = st.sidebar.checkbox(
+        "Standardize group features",
+        value=True,
+        help="Recommended when features are on different scales.",
+    )
+    group_cluster_weight_by_count = st.sidebar.checkbox(
+        "Weight group clustering by group size",
+        value=True,
+        help="Gives larger groups more influence in the model fit.",
+    )
+    group_cluster_min_records = st.sidebar.number_input(
+        "Minimum records per group for clustering",
+        min_value=1,
+        max_value=1000,
+        value=5,
+        step=1,
+    )
+    group_cluster_random_state = st.sidebar.number_input(
+        "Group clustering random seed",
+        min_value=0,
+        max_value=10000,
+        value=42,
+        step=1,
+    )
+    group_cluster_n_init = st.sidebar.number_input(
+        "Group clustering n_init",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1,
+        help="Number of centroid initializations.",
+    )
+
+    st.sidebar.markdown("### Individual Clustering Parameters")
+    individual_cluster_k_range = st.sidebar.slider(
+        "Individual clustering k-range",
+        min_value=2,
+        max_value=10,
+        value=(2, 6),
+        help="K-Means will be run for each k in this range, and the best silhouette score will be selected.",
+    )
+    individual_cluster_standardize = st.sidebar.checkbox(
+        "Standardize individual features",
+        value=True,
+        help="Standardize Absense Occasions and Days Absent before clustering.",
+    )
+    individual_cluster_random_state = st.sidebar.number_input(
+        "Individual clustering random seed",
+        min_value=0,
+        max_value=10000,
+        value=42,
+        step=1,
+    )
+    individual_cluster_n_init = st.sidebar.number_input(
+        "Individual clustering n_init",
+        min_value=1,
+        max_value=100,
+        value=10,
+        step=1,
+    )
+
+group_cluster_config = ClusterConfig(
+    k_min=int(group_cluster_k_range[0]),
+    k_max=int(group_cluster_k_range[1]),
+    standardize=bool(group_cluster_standardize),
+    weight_by_count=bool(group_cluster_weight_by_count),
+    min_records_per_group=int(group_cluster_min_records),
+    random_state=int(group_cluster_random_state),
+    n_init=int(group_cluster_n_init),
+)
+
+individual_cluster_config = IndividualClusterConfig(
+    k_min=int(individual_cluster_k_range[0]),
+    k_max=int(individual_cluster_k_range[1]),
+    standardize=bool(individual_cluster_standardize),
+    random_state=int(individual_cluster_random_state),
+    n_init=int(individual_cluster_n_init),
+)
+
+
+# =========================================================
 # Main app
 # =========================================================
 st.title(APP_TITLE)
 st.caption(
     "Upload a CSV with columns such as "
     f"'{COL_EMPLOYEE_ID}', '{COL_ABSENCE_OCCASIONS}', '{COL_DAYS_ABSENT}', and a categorical grouping column."
-)
-
-anonymize_ids = st.checkbox(
-    "Anonymize Industry Number values on load",
-    value=True,
-    help="If selected, Industry Number values will be replaced with sequential integers. If not selected, original values are retained.",
 )
 
 uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
@@ -826,7 +949,7 @@ if not group_candidates:
     st.stop()
 
 # ---------------------------------------------------------
-# Sidebar controls
+# Sidebar analysis controls
 # ---------------------------------------------------------
 st.sidebar.header("Analysis Controls")
 
@@ -958,63 +1081,15 @@ with tab_clustering:
     if not SKLEARN_AVAILABLE:
         st.warning("scikit-learn is not available in this environment, so clustering cannot be run.")
     else:
-        c1, c2, c3 = st.columns(3)
-        k_range = c1.slider(
-            "Range of k to evaluate",
-            min_value=2,
-            max_value=15,
-            value=(2, 8),
-            help="K-Means will be run for each k in this range, and the best silhouette score will be selected.",
-        )
-        standardize = c2.checkbox(
-            "Standardize features",
-            value=True,
-            help="Recommended when features are on different scales.",
-        )
-        weight_by_count = c3.checkbox(
-            "Weight by group size",
-            value=True,
-            help="Gives larger groups more influence in the model fit.",
-        )
-
-        c4, c5, c6 = st.columns(3)
-        min_records_cluster = c4.number_input(
-            "Minimum records per group for clustering",
-            min_value=1,
-            max_value=1000,
-            value=5,
-            step=1,
-        )
-        random_state = c5.number_input(
-            "Random seed",
-            min_value=0,
-            max_value=10000,
-            value=42,
-            step=1,
-        )
-        n_init = c6.number_input(
-            "n_init",
-            min_value=1,
-            max_value=100,
-            value=10,
-            step=1,
-            help="Number of centroid initializations.",
-        )
-
-        cluster_config = ClusterConfig(
-            k_min=int(k_range[0]),
-            k_max=int(k_range[1]),
-            standardize=bool(standardize),
-            weight_by_count=bool(weight_by_count),
-            min_records_per_group=int(min_records_cluster),
-            random_state=int(random_state),
-            n_init=int(n_init),
-        )
+        if not show_clustering_parameters:
+            st.caption("Using default clustering parameters. Enable 'Edit clustering parameters' in the sidebar to customize them.")
+        else:
+            st.caption("Using clustering parameters configured in the sidebar.")
 
         mapping_df, silhouette_df, best_k, best_score = run_kmeans_clustering(
             agg_df=agg_df,
             group_col=group_col,
-            config=cluster_config,
+            config=group_cluster_config,
         )
 
         if mapping_df is None or best_k is None or best_score is None:
@@ -1192,37 +1267,23 @@ with tab_distributions:
                     if valid_points < 3:
                         st.info("At least 3 individual records with valid Absense Occasions and Days Absent are required.")
                     else:
-                        c1, c2, c3 = st.columns(3)
-                        max_k_allowed = min(10, max(2, valid_points - 1))
+                        if not show_clustering_parameters:
+                            st.caption("Using default individual clustering parameters from the sidebar settings.")
+                        else:
+                            st.caption("Using individual clustering parameters configured in the sidebar.")
 
-                        individual_k_range = c1.slider(
-                            "Individual clustering k-range",
-                            min_value=2,
-                            max_value=max_k_allowed,
-                            value=(2, min(6, max_k_allowed)),
-                            help="K-Means will be evaluated across this range and the best silhouette score selected.",
-                        )
-                        individual_standardize = c2.checkbox(
-                            "Standardize individual features",
-                            value=True,
-                            help="Standardize Absense Occasions and Days Absent before clustering.",
-                        )
-                        individual_n_init = c3.number_input(
-                            "Individual clustering n_init",
-                            min_value=1,
-                            max_value=100,
-                            value=10,
-                            step=1,
+                        adjusted_individual_config = IndividualClusterConfig(
+                            k_min=individual_cluster_config.k_min,
+                            k_max=min(individual_cluster_config.k_max, max(2, valid_points - 1)),
+                            standardize=individual_cluster_config.standardize,
+                            random_state=individual_cluster_config.random_state,
+                            n_init=individual_cluster_config.n_init,
                         )
 
                         clustered_individuals_df, individual_silhouette_df, best_individual_k, best_individual_score = (
                             run_individual_kmeans_clustering(
                                 df_group=single_group_df,
-                                k_min=int(individual_k_range[0]),
-                                k_max=int(individual_k_range[1]),
-                                standardize=bool(individual_standardize),
-                                random_state=42,
-                                n_init=int(individual_n_init),
+                                config=adjusted_individual_config,
                             )
                         )
 
@@ -1291,7 +1352,10 @@ with tab_distributions:
 with tab_correlations:
     st.subheader("Correlation Analysis")
 
-    correlation_columns = [col for col in [COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT, COL_BRADFORD, COL_OVERTIME] if col in df.columns]
+    correlation_columns = [
+        col for col in [COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT, COL_BRADFORD, COL_OVERTIME]
+        if col in df.columns
+    ]
 
     if len(correlation_columns) < 3:
         st.info(
