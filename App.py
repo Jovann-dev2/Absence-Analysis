@@ -41,6 +41,7 @@ COL_REPORTING_DISCIPLINE = "Reporting Discipline"
 COL_BRADFORD = "Bradford Score"
 COL_OVERTIME = "Overtime Avg (12 Months)"
 COL_CLUSTER = "Overall Grouping"
+COL_INDIVIDUAL_CLUSTER = "Individual Cluster"
 
 REQUIRED_COLUMNS = [
     COL_EMPLOYEE_ID,
@@ -77,6 +78,7 @@ EXCLUDED_GROUP_COLUMNS = {
     COL_BRADFORD,
     COL_OVERTIME,
     COL_CLUSTER,
+    COL_INDIVIDUAL_CLUSTER,
 }
 
 
@@ -139,11 +141,7 @@ def coerce_numeric_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataF
 
 def sanitize_text_column(series: pd.Series) -> pd.Series:
     """Convert values to stripped strings while preserving missing values."""
-    return (
-        series.astype("string")
-        .fillna(pd.NA)
-        .str.strip()
-    )
+    return series.astype("string").fillna(pd.NA).str.strip()
 
 
 def get_grouping_candidates(
@@ -324,7 +322,6 @@ def build_scatter_chart(
     title: str | None = None,
 ) -> alt.Chart:
     """Create a scatter plot of average absence occasions vs average days absent."""
-
     cols = [group_col, "avg_absense_occasions", "avg_days_absent", "count"]
     if color_field and color_field not in cols:
         cols.append(color_field)
@@ -338,16 +335,20 @@ def build_scatter_chart(
     overall_x = df["avg_absense_occasions"].median(skipna=True)
     overall_y = df["avg_days_absent"].median(skipna=True)
 
+    tooltips = [
+        alt.Tooltip(f"{group_col}:N", title="Group"),
+        alt.Tooltip("avg_absense_occasions:Q", title="Avg Absense Occasions", format=".2f"),
+        alt.Tooltip("avg_days_absent:Q", title="Avg Days Absent", format=".2f"),
+        alt.Tooltip("count:Q", title="Records in Group"),
+    ]
+
+    if color_field:
+        tooltips.append(alt.Tooltip(f"{color_field}:N", title="Cluster"))
+
     encodings = {
         "x": alt.X("avg_absense_occasions:Q", title="Average Absense Occasions"),
         "y": alt.Y("avg_days_absent:Q", title="Average Days Absent"),
-        "tooltip": [
-            alt.Tooltip(f"{group_col}:N", title="Group"),
-            alt.Tooltip("avg_absense_occasions:Q", title="Avg Absense Occasions", format=".2f"),
-            alt.Tooltip("avg_days_absent:Q", title="Avg Days Absent", format=".2f"),
-            alt.Tooltip("count:Q", title="Records in Group"),
-            alt.Tooltip(f"{color_field}:N", title="Cluster")
-        ],
+        "tooltip": tooltips,
     }
 
     if color_field:
@@ -391,6 +392,33 @@ def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30
             ],
         )
         .properties(height=280)
+    )
+
+
+def build_group_distribution_chart(group_counts: pd.Series, group_col: str) -> alt.Chart:
+    """Build a descending group count bar chart (not alphabetical)."""
+    if group_counts.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
+    plot_df = (
+        group_counts.rename_axis(group_col)
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return (
+        alt.Chart(plot_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("count:Q", title="Record Count"),
+            y=alt.Y(f"{group_col}:N", title=group_col, sort="-x"),
+            tooltip=[
+                alt.Tooltip(f"{group_col}:N", title="Group"),
+                alt.Tooltip("count:Q", title="Count"),
+            ],
+        )
+        .properties(height=max(320, min(900, len(plot_df) * 22)))
     )
 
 
@@ -593,13 +621,138 @@ def run_kmeans_clustering(
     return mapping_df, silhouette_df, best_k, float(best_score)
 
 
+def run_individual_kmeans_clustering(
+    df_group: pd.DataFrame,
+    k_min: int = 2,
+    k_max: int = 6,
+    standardize: bool = True,
+    random_state: int = 42,
+    n_init: int = 10,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, int | None, float | None]:
+    """
+    Cluster individual records within a single selected group using:
+    - x: Absense Occasions
+    - y: Days Absent
+
+    Returns:
+        clustered_df,
+        silhouette_df,
+        best_k,
+        best_silhouette
+    """
+    work_df = df_group.copy()
+    work_df = work_df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).reset_index(drop=True)
+
+    if len(work_df) < 3:
+        return None, None, None, None
+
+    X = work_df[[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]].to_numpy(dtype=float)
+
+    if standardize:
+        scaler = StandardScaler()
+        X_proc = scaler.fit_transform(X)
+    else:
+        X_proc = X
+
+    n_samples = len(work_df)
+    min_k = max(2, k_min)
+    max_k = min(k_max, n_samples - 1)
+
+    if min_k > max_k:
+        return None, None, None, None
+
+    silhouette_rows: list[dict[str, float | int]] = []
+    best_k: int | None = None
+    best_score = -np.inf
+    best_labels: np.ndarray | None = None
+
+    for k in range(min_k, max_k + 1):
+        model = KMeans(
+            n_clusters=k,
+            random_state=random_state,
+            n_init=n_init,
+        )
+        model.fit(X_proc)
+        labels = model.labels_.astype(int)
+
+        try:
+            score = float(silhouette_score(X_proc, labels, metric="euclidean"))
+        except Exception:
+            score = np.nan
+
+        silhouette_rows.append({"k": k, "silhouette": score})
+
+        if np.isfinite(score) and (score > best_score or (np.isclose(score, best_score) and (best_k is None or k < best_k))):
+            best_k = k
+            best_score = score
+            best_labels = labels
+
+    if best_k is None or best_labels is None:
+        return None, pd.DataFrame(silhouette_rows), None, None
+
+    label_names = {i: f"Cluster {i + 1}" for i in range(best_k)}
+    work_df[COL_INDIVIDUAL_CLUSTER] = [label_names[i] for i in best_labels]
+
+    silhouette_df = pd.DataFrame(silhouette_rows).sort_values("k").reset_index(drop=True)
+    return work_df, silhouette_df, best_k, float(best_score)
+
+
+def build_individual_scatter_chart(
+    df: pd.DataFrame,
+    group_col: str,
+    color_field: str | None = None,
+    title: str | None = None,
+) -> alt.Chart:
+    """Scatter plot of individual records in a chosen group."""
+    plot_df = df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).copy()
+
+    if plot_df.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
+    tooltip_fields = [
+        alt.Tooltip(f"{COL_EMPLOYEE_ID}:N", title=COL_EMPLOYEE_ID),
+        alt.Tooltip(f"{group_col}:N", title="Group"),
+        alt.Tooltip(f"{COL_ABSENCE_OCCASIONS}:Q", title=COL_ABSENCE_OCCASIONS, format=".2f"),
+        alt.Tooltip(f"{COL_DAYS_ABSENT}:Q", title=COL_DAYS_ABSENT, format=".2f"),
+    ]
+
+    if COL_OVERTIME in plot_df.columns:
+        tooltip_fields.append(alt.Tooltip(f"{COL_OVERTIME}:Q", title=COL_OVERTIME, format=".2f"))
+
+    if color_field and color_field in plot_df.columns:
+        tooltip_fields.append(alt.Tooltip(f"{color_field}:N", title=color_field))
+
+    encodings = {
+        "x": alt.X(f"{COL_ABSENCE_OCCASIONS}:Q", title=COL_ABSENCE_OCCASIONS),
+        "y": alt.Y(f"{COL_DAYS_ABSENT}:Q", title=COL_DAYS_ABSENT),
+        "tooltip": tooltip_fields,
+    }
+
+    if color_field and color_field in plot_df.columns:
+        encodings["color"] = alt.Color(f"{color_field}:N", title=color_field)
+
+    chart = (
+        alt.Chart(plot_df)
+        .mark_circle(size=75, opacity=0.8)
+        .encode(**encodings)
+        .properties(height=450)
+        .interactive()
+    )
+
+    if title:
+        chart = chart.properties(title=title)
+
+    return chart
+
+
 # =========================================================
 # Cached file loader
 # =========================================================
 @st.cache_data(show_spinner=False)
-def load_and_prepare_csv(file_bytes: bytes) -> pd.DataFrame:
+def load_and_prepare_csv(file_bytes: bytes, anonymize_ids: bool) -> pd.DataFrame:
     """
-    Read, standardize, validate, coerce numeric columns, and anonymize PII immediately.
+    Read, standardize, validate, coerce numeric columns,
+    and optionally anonymize employee IDs.
     """
     df = pd.read_csv(io.BytesIO(file_bytes))
     df = standardize_column_names(df)
@@ -612,7 +765,9 @@ def load_and_prepare_csv(file_bytes: bytes) -> pd.DataFrame:
         )
 
     df = coerce_numeric_columns(df, NUMERIC_COLUMNS)
-    df = anonymize_employee_ids(df)
+
+    if anonymize_ids:
+        df = anonymize_employee_ids(df)
 
     return df
 
@@ -640,8 +795,13 @@ def render_dataset_overview(df: pd.DataFrame, group_col: str) -> None:
 st.title(APP_TITLE)
 st.caption(
     "Upload a CSV with columns such as "
-    f"'{COL_EMPLOYEE_ID}', '{COL_ABSENCE_OCCASIONS}', '{COL_DAYS_ABSENT}', and a categorical grouping column. "
-    "Employee identifiers are anonymized immediately."
+    f"'{COL_EMPLOYEE_ID}', '{COL_ABSENCE_OCCASIONS}', '{COL_DAYS_ABSENT}', and a categorical grouping column."
+)
+
+anonymize_ids = st.checkbox(
+    "Anonymize Industry Number values on load",
+    value=True,
+    help="If selected, Industry Number values will be replaced with sequential integers. If not selected, original values are retained.",
 )
 
 uploaded_file = st.file_uploader("Upload a CSV file", type=["csv"])
@@ -652,7 +812,7 @@ if uploaded_file is None:
 
 try:
     raw_bytes = uploaded_file.getvalue()
-    df_all = load_and_prepare_csv(raw_bytes)
+    df_all = load_and_prepare_csv(raw_bytes, anonymize_ids)
 except Exception as exc:
     st.error(f"Could not read the uploaded file. Details: {exc}")
     st.stop()
@@ -734,14 +894,19 @@ if exclude_unfit and not excluded_values_df.empty:
             f"Excluded **{int(excluded_values_df['rows_excluded'].sum()):,}** row(s) "
             f"across **{len(excluded_values_df):,}** distinct Reporting Discipline value(s)."
         )
-        st.dataframe(excluded_values_df, width='stretch')
+        st.dataframe(excluded_values_df, use_container_width=True)
 
 st.subheader("Group Distribution")
-st.bar_chart(group_counts.sort_values(by = 'count', ascending=False))
-st.caption("Record counts per group after applying the selected filters.")
+group_distribution_chart = build_group_distribution_chart(group_counts, group_col)
+st.altair_chart(group_distribution_chart, use_container_width=True)
+st.caption("Record counts per group after applying the selected filters, sorted in descending order.")
 
-with st.expander("Preview of imported data (PII anonymized)", expanded=False):
-    st.dataframe(df.head(200), width='stretch')
+preview_label = "Preview of imported data"
+if anonymize_ids:
+    preview_label += " (PII anonymized)"
+
+with st.expander(preview_label, expanded=False):
+    st.dataframe(df.head(200), use_container_width=True)
 
 # ---------------------------------------------------------
 # Group statistics
@@ -750,7 +915,7 @@ agg_df = compute_group_statistics(df, group_col)
 
 st.subheader("Group-level Statistics")
 st.caption(f"Averages, medians, standard deviations, and row counts by '{group_col}'.")
-st.dataframe(agg_df, width='stretch')
+st.dataframe(agg_df, use_container_width=True)
 
 st.download_button(
     label="Download group-level statistics (CSV)",
@@ -782,7 +947,7 @@ with tab_scatter:
             group_col=group_col,
             title="Group Averages",
         )
-        st.altair_chart(scatter_chart, width='stretch')
+        st.altair_chart(scatter_chart, use_container_width=True)
 
 # =========================================================
 # Clustering tab
@@ -791,9 +956,7 @@ with tab_clustering:
     st.subheader("Statistical Grouping (K-Means)")
 
     if not SKLEARN_AVAILABLE:
-        st.warning(
-            "scikit-learn is not available in this environment, so clustering cannot be run."
-        )
+        st.warning("scikit-learn is not available in this environment, so clustering cannot be run.")
     else:
         c1, c2, c3 = st.columns(3)
         k_range = c1.slider(
@@ -864,7 +1027,7 @@ with tab_clustering:
 
             st.markdown("### Group-to-Cluster Mapping")
             view_df = mapping_df.sort_values([COL_CLUSTER, group_col]).reset_index(drop=True)
-            st.dataframe(view_df, width='stretch')
+            st.dataframe(view_df, use_container_width=True)
 
             st.download_button(
                 label="Download cluster mapping (CSV)",
@@ -875,7 +1038,7 @@ with tab_clustering:
 
             with st.expander("Silhouette diagnostics", expanded=False):
                 if silhouette_df is not None and not silhouette_df.empty:
-                    st.dataframe(silhouette_df, width='stretch')
+                    st.dataframe(silhouette_df, use_container_width=True)
                     sil_chart = (
                         alt.Chart(silhouette_df)
                         .mark_line(point=True)
@@ -890,17 +1053,17 @@ with tab_clustering:
                         .properties(height=260)
                         .interactive()
                     )
-                    st.altair_chart(sil_chart, width='stretch')
+                    st.altair_chart(sil_chart, use_container_width=True)
 
             st.markdown("### Scatter by Cluster")
             cluster_plot_df = mapping_df.copy()
             cluster_chart = build_scatter_chart(
                 df=cluster_plot_df,
                 group_col=group_col,
-                color_field="Overall Grouping",
+                color_field=COL_CLUSTER,
                 title="Clustered Group Averages",
             )
-            st.altair_chart(cluster_chart, width='stretch')
+            st.altair_chart(cluster_chart, use_container_width=True)
 
 # =========================================================
 # Distributions tab
@@ -923,6 +1086,7 @@ with tab_distributions:
     )
 
     selected_groups: list[str] = []
+    selected_group: str | None = None
 
     if view_mode == "Single Group":
         group_options = (
@@ -969,8 +1133,12 @@ with tab_distributions:
     if selected_groups:
         subset = df[df[group_col].astype(str).isin(selected_groups)].copy()
 
-        metric_columns = [col for col in [COL_DAYS_ABSENT, COL_ABSENCE_OCCASIONS, COL_BRADFORD, COL_OVERTIME] if col in subset.columns]
-        subset = subset.dropna(subset=metric_columns, how="all")
+        # Bradford removed from Distribution Explorer charts and summary
+        distribution_metric_columns = [
+            col for col in [COL_DAYS_ABSENT, COL_ABSENCE_OCCASIONS, COL_OVERTIME]
+            if col in subset.columns
+        ]
+        subset = subset.dropna(subset=distribution_metric_columns, how="all")
 
         if subset.empty:
             st.info("No individual-level rows are available for the current selection.")
@@ -982,24 +1150,140 @@ with tab_distributions:
                 charts.append(build_histogram(subset, COL_DAYS_ABSENT, COL_DAYS_ABSENT, bins=histogram_bins))
             if COL_ABSENCE_OCCASIONS in subset.columns:
                 charts.append(build_histogram(subset, COL_ABSENCE_OCCASIONS, COL_ABSENCE_OCCASIONS, bins=histogram_bins))
-            if COL_BRADFORD in subset.columns:
-                charts.append(build_histogram(subset, COL_BRADFORD, COL_BRADFORD, bins=histogram_bins))
             if COL_OVERTIME in subset.columns:
                 charts.append(build_histogram(subset, COL_OVERTIME, COL_OVERTIME, bins=histogram_bins))
 
             st.markdown("### Distributions")
             for chart in charts:
-                st.altair_chart(chart, width='stretch')
+                st.altair_chart(chart, use_container_width=True)
 
             with st.expander("Summary statistics for current selection", expanded=False):
                 summary_df = summarize_numeric_columns(
                     subset,
-                    [COL_DAYS_ABSENT, COL_ABSENCE_OCCASIONS, COL_BRADFORD, COL_OVERTIME],
+                    [COL_DAYS_ABSENT, COL_ABSENCE_OCCASIONS, COL_OVERTIME],
                 )
                 if summary_df.empty:
                     st.info("No summary statistics are available.")
                 else:
-                    st.dataframe(summary_df.round(2), width='stretch')
+                    st.dataframe(summary_df.round(2), use_container_width=True)
+
+            # -------------------------------------------------
+            # Individual scatter + clustering for selected group
+            # -------------------------------------------------
+            if view_mode == "Single Group" and selected_group is not None:
+                st.markdown("### Individual Scatter Plot")
+
+                single_group_df = df[df[group_col].astype(str) == str(selected_group)].copy()
+
+                individual_scatter = build_individual_scatter_chart(
+                    single_group_df,
+                    group_col=group_col,
+                    title=f"Individuals in {selected_group}",
+                )
+                st.altair_chart(individual_scatter, use_container_width=True)
+
+                st.markdown("### Clustered Individual Scatter Plot")
+
+                if not SKLEARN_AVAILABLE:
+                    st.warning("scikit-learn is not available in this environment, so individual clustering cannot be run.")
+                else:
+                    valid_points = single_group_df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).shape[0]
+
+                    if valid_points < 3:
+                        st.info("At least 3 individual records with valid Absense Occasions and Days Absent are required.")
+                    else:
+                        c1, c2, c3 = st.columns(3)
+                        max_k_allowed = min(10, max(2, valid_points - 1))
+
+                        individual_k_range = c1.slider(
+                            "Individual clustering k-range",
+                            min_value=2,
+                            max_value=max_k_allowed,
+                            value=(2, min(6, max_k_allowed)),
+                            help="K-Means will be evaluated across this range and the best silhouette score selected.",
+                        )
+                        individual_standardize = c2.checkbox(
+                            "Standardize individual features",
+                            value=True,
+                            help="Standardize Absense Occasions and Days Absent before clustering.",
+                        )
+                        individual_n_init = c3.number_input(
+                            "Individual clustering n_init",
+                            min_value=1,
+                            max_value=100,
+                            value=10,
+                            step=1,
+                        )
+
+                        clustered_individuals_df, individual_silhouette_df, best_individual_k, best_individual_score = (
+                            run_individual_kmeans_clustering(
+                                df_group=single_group_df,
+                                k_min=int(individual_k_range[0]),
+                                k_max=int(individual_k_range[1]),
+                                standardize=bool(individual_standardize),
+                                random_state=42,
+                                n_init=int(individual_n_init),
+                            )
+                        )
+
+                        if (
+                            clustered_individuals_df is None
+                            or best_individual_k is None
+                            or best_individual_score is None
+                        ):
+                            st.info("Unable to cluster individual records for the selected group.")
+                        else:
+                            st.success(
+                                f"Selected k = {best_individual_k} "
+                                f"(silhouette = {best_individual_score:.3f}) for individuals in '{selected_group}'."
+                            )
+
+                            clustered_scatter = build_individual_scatter_chart(
+                                clustered_individuals_df,
+                                group_col=group_col,
+                                color_field=COL_INDIVIDUAL_CLUSTER,
+                                title=f"Clustered Individuals in {selected_group}",
+                            )
+                            st.altair_chart(clustered_scatter, use_container_width=True)
+
+                            with st.expander("Individual clustering diagnostics", expanded=False):
+                                if individual_silhouette_df is not None and not individual_silhouette_df.empty:
+                                    st.dataframe(individual_silhouette_df, use_container_width=True)
+
+                                    sil_chart = (
+                                        alt.Chart(individual_silhouette_df)
+                                        .mark_line(point=True)
+                                        .encode(
+                                            x=alt.X("k:Q", title="k (number of clusters)"),
+                                            y=alt.Y("silhouette:Q", title="Silhouette score"),
+                                            tooltip=[
+                                                alt.Tooltip("k:Q"),
+                                                alt.Tooltip("silhouette:Q", format=".3f"),
+                                            ],
+                                        )
+                                        .properties(height=260)
+                                        .interactive()
+                                    )
+                                    st.altair_chart(sil_chart, use_container_width=True)
+
+                            with st.expander("Clustered individual records", expanded=False):
+                                display_cols = [
+                                    col for col in [
+                                        COL_EMPLOYEE_ID,
+                                        group_col,
+                                        COL_ABSENCE_OCCASIONS,
+                                        COL_DAYS_ABSENT,
+                                        COL_OVERTIME,
+                                        COL_INDIVIDUAL_CLUSTER,
+                                    ]
+                                    if col in clustered_individuals_df.columns
+                                ]
+                                st.dataframe(
+                                    clustered_individuals_df[display_cols].sort_values(
+                                        by=[COL_INDIVIDUAL_CLUSTER, COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]
+                                    ),
+                                    use_container_width=True,
+                                )
 
 # =========================================================
 # Correlations tab
@@ -1031,7 +1315,7 @@ with tab_correlations:
         if overall_heatmap is None:
             st.info("No overall correlation matrix could be computed.")
         else:
-            st.altair_chart(overall_heatmap, width='stretch')
+            st.altair_chart(overall_heatmap, use_container_width=True)
 
         st.markdown("### Segmented Correlation Heat Maps")
         segment_mode = st.radio(
@@ -1071,7 +1355,7 @@ with tab_correlations:
                             if chart is None:
                                 st.info("No correlation matrix could be computed for this group.")
                             else:
-                                st.altair_chart(chart, width='stretch')
+                                st.altair_chart(chart, use_container_width=True)
 
         else:
             if mapping_df is None or COL_CLUSTER not in mapping_df.columns:
@@ -1116,4 +1400,4 @@ with tab_correlations:
                                 if chart is None:
                                     st.info("No correlation matrix could be computed for this cluster.")
                                 else:
-                                    st.altair_chart(chart, width='stretch')
+                                    st.altair_chart(chart, use_container_width=True)
