@@ -572,7 +572,194 @@ def summarize_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFr
         result = result.merge(summary, on="metric", how="outer")
 
     return result
+def compute_overtime_summary(df: pd.DataFrame, high_threshold: float) -> dict[str, float | int] | None:
+    """Return key overtime summary metrics for the provided dataframe."""
+    if COL_OVERTIME not in df.columns:
+        return None
 
+    series = pd.to_numeric(df[COL_OVERTIME], errors="coerce").dropna()
+    if series.empty:
+        return None
+
+    return {
+        "count": int(series.count()),
+        "mean": float(series.mean()),
+        "median": float(series.median()),
+        "std": float(series.std(ddof=1)) if series.count() > 1 else np.nan,
+        "min": float(series.min()),
+        "p90": float(series.quantile(0.90)),
+        "p95": float(series.quantile(0.95)),
+        "max": float(series.max()),
+        "pct_zero": float((series == 0).mean() * 100),
+        "pct_high": float((series >= high_threshold).mean() * 100),
+    }
+
+
+def compute_group_overtime_statistics(
+    df: pd.DataFrame,
+    group_col: str,
+    high_threshold: float,
+) -> pd.DataFrame:
+    """Compute group-level overtime statistics."""
+    if COL_OVERTIME not in df.columns:
+        return pd.DataFrame()
+
+    work_df = df[[COL_EMPLOYEE_ID, group_col, COL_OVERTIME]].copy()
+    work_df[group_col] = sanitize_text_column(work_df[group_col])
+    work_df[COL_OVERTIME] = pd.to_numeric(work_df[COL_OVERTIME], errors="coerce")
+
+    total_rows = (
+        work_df.groupby(group_col, dropna=False)
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+
+    valid_df = work_df.dropna(subset=[COL_OVERTIME]).copy()
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    grouped = valid_df.groupby(group_col, dropna=False)
+
+    stats_df = grouped.agg(
+        overtime_mean=(COL_OVERTIME, "mean"),
+        overtime_median=(COL_OVERTIME, "median"),
+        overtime_std=(COL_OVERTIME, "std"),
+        overtime_min=(COL_OVERTIME, "min"),
+        overtime_p90=(COL_OVERTIME, lambda s: s.quantile(0.90)),
+        overtime_p95=(COL_OVERTIME, lambda s: s.quantile(0.95)),
+        overtime_max=(COL_OVERTIME, "max"),
+        overtime_non_null=(COL_OVERTIME, "count"),
+        pct_zero_overtime=(COL_OVERTIME, lambda s: float((s == 0).mean() * 100)),
+        pct_high_overtime=(COL_OVERTIME, lambda s: float((s >= high_threshold).mean() * 100)),
+    ).reset_index()
+
+    result = total_rows.merge(stats_df, on=group_col, how="left")
+    return result.sort_values(
+        by=["overtime_median", "overtime_mean"],
+        ascending=[False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def build_ranked_overtime_group_chart(
+    stats_df: pd.DataFrame,
+    group_col: str,
+    metric_col: str,
+    metric_title: str,
+    chart_title: str,
+    top_n: int = 20,
+) -> alt.Chart:
+    """Build a ranked bar chart for a selected overtime metric by group."""
+    if stats_df.empty or metric_col not in stats_df.columns:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
+    plot_df = (
+        stats_df[[group_col, metric_col, "row_count"]]
+        .dropna(subset=[metric_col])
+        .sort_values(metric_col, ascending=False)
+        .head(top_n)
+        .copy()
+    )
+
+    if plot_df.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
+    return (
+        alt.Chart(plot_df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{metric_col}:Q", title=metric_title),
+            y=alt.Y(f"{group_col}:N", title=group_col, sort="-x"),
+            tooltip=[
+                alt.Tooltip(f"{group_col}:N", title="Group"),
+                alt.Tooltip(f"{metric_col}:Q", title=metric_title, format=".2f"),
+                alt.Tooltip("row_count:Q", title="Rows"),
+            ],
+        )
+        .properties(height=max(320, min(800, len(plot_df) * 24)), title=chart_title)
+    )
+
+
+def build_overtime_band_chart(df: pd.DataFrame) -> alt.Chart:
+    """Build a fixed-band overtime distribution chart."""
+    if COL_OVERTIME not in df.columns:
+        return alt.Chart(pd.DataFrame({"message": ["No overtime column available"]})).mark_text(size=14).encode(
+            text="message:N"
+        )
+
+    series = pd.to_numeric(df[COL_OVERTIME], errors="coerce").dropna()
+    if series.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No overtime data available"]})).mark_text(size=14).encode(
+            text="message:N"
+        )
+
+    bins = [-np.inf, 0, 10, 20, 40, np.inf]
+    labels = ["0", ">0 to 10", "10 to 20", "20 to 40", "40+"]
+
+    band_df = pd.DataFrame({COL_OVERTIME: series})
+    band_df["Overtime Band"] = pd.cut(
+        band_df[COL_OVERTIME],
+        bins=bins,
+        labels=labels,
+        include_lowest=True,
+        right=True,
+    )
+
+    plot_df = (
+        band_df["Overtime Band"]
+        .value_counts(dropna=False)
+        .reindex(labels, fill_value=0)
+        .rename_axis("Overtime Band")
+        .reset_index(name="count")
+    )
+
+    return (
+        alt.Chart(plot_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Overtime Band:N", sort=labels, title="Overtime Band"),
+            y=alt.Y("count:Q", title="Count"),
+            tooltip=[
+                alt.Tooltip("Overtime Band:N", title="Overtime Band"),
+                alt.Tooltip("count:Q", title="Count"),
+            ],
+        )
+        .properties(height=300, title="Overtime Band Distribution")
+    )
+
+
+def build_overtime_boxplot(
+    df: pd.DataFrame,
+    group_col: str,
+    top_groups: list[str],
+    title: str,
+) -> alt.Chart:
+    """Build a boxplot of overtime for selected groups."""
+    if COL_OVERTIME not in df.columns:
+        return alt.Chart(pd.DataFrame({"message": ["No overtime column available"]})).mark_text(size=14).encode(
+            text="message:N"
+        )
+
+    plot_df = df[df[group_col].astype(str).isin([str(g) for g in top_groups])].copy()
+    plot_df = plot_df.dropna(subset=[COL_OVERTIME])
+
+    if plot_df.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
+    return (
+        alt.Chart(plot_df)
+        .mark_boxplot(size=28)
+        .encode(
+            x=alt.X(f"{group_col}:N", title=group_col, sort=top_groups),
+            y=alt.Y(f"{COL_OVERTIME}:Q", title=COL_OVERTIME),
+            tooltip=[
+                alt.Tooltip(f"{group_col}:N", title="Group"),
+                alt.Tooltip(f"{COL_OVERTIME}:Q", title=COL_OVERTIME, format=".2f"),
+            ],
+        )
+        .properties(height=420, title=title)
+    )
 
 def run_kmeans_clustering(
     agg_df: pd.DataFrame,
@@ -1139,8 +1326,8 @@ st.download_button(
 # ---------------------------------------------------------
 # Tabs for analysis sections
 # ---------------------------------------------------------
-tab_scatter, tab_clustering, tab_distributions, tab_correlations = st.tabs(
-    ["Scatter", "Clustering", "Distributions", "Correlations"]
+tab_scatter, tab_clustering, tab_distributions, tab_overtime, tab_correlations = st.tabs(
+    ["Scatter", "Clustering", "Distributions", "Overtime", "Correlations"]
 )
 
 mapping_df: pd.DataFrame | None = None
@@ -1463,7 +1650,267 @@ with tab_distributions:
                                     ),
                                     use_container_width=True,
                                 )
+                                
+# =========================================================
+# Overtime tab
+# =========================================================
+with tab_overtime:
+    st.subheader("Overtime Analysis")
 
+    if COL_OVERTIME not in df.columns:
+        st.info(
+            f"No '{COL_OVERTIME}' column is available in the uploaded dataset, so overtime analytics cannot be shown."
+        )
+    else:
+        overtime_valid_series = pd.to_numeric(df[COL_OVERTIME], errors="coerce").dropna()
+
+        if overtime_valid_series.empty:
+            st.info("The overtime column exists, but no valid numeric overtime values are available after cleaning.")
+        else:
+            overtime_view_mode = st.radio(
+                "Analyse overtime for",
+                options=["All Filtered Data", "Single Group", "Cluster"],
+                horizontal=True,
+            )
+
+            overtime_subset = df.copy()
+            overtime_selection_label = "All filtered data"
+
+            if overtime_view_mode == "Single Group":
+                overtime_group_options = (
+                    df[group_col]
+                    .dropna()
+                    .astype(str)
+                    .sort_values()
+                    .unique()
+                    .tolist()
+                )
+
+                if not overtime_group_options:
+                    st.info("No groups are available for overtime analysis.")
+                    overtime_subset = pd.DataFrame()
+                else:
+                    overtime_selected_group = st.selectbox(
+                        "Select a group for overtime analysis",
+                        options=overtime_group_options,
+                        key="overtime_single_group_select",
+                    )
+                    overtime_subset = df[df[group_col].astype(str) == str(overtime_selected_group)].copy()
+                    overtime_selection_label = f"Group: {overtime_selected_group}"
+
+            elif overtime_view_mode == "Cluster":
+                if mapping_df is None or COL_CLUSTER not in mapping_df.columns:
+                    st.info("Run clustering first to enable cluster-level overtime analysis.")
+                    overtime_subset = pd.DataFrame()
+                else:
+                    overtime_cluster_options = (
+                        mapping_df[COL_CLUSTER]
+                        .dropna()
+                        .astype(str)
+                        .sort_values()
+                        .unique()
+                        .tolist()
+                    )
+
+                    if not overtime_cluster_options:
+                        st.info("No clusters are available.")
+                        overtime_subset = pd.DataFrame()
+                    else:
+                        overtime_selected_cluster = st.selectbox(
+                            "Select a cluster for overtime analysis",
+                            options=overtime_cluster_options,
+                            key="overtime_cluster_select",
+                        )
+
+                        overtime_selected_groups = (
+                            mapping_df.loc[
+                                mapping_df[COL_CLUSTER].astype(str) == str(overtime_selected_cluster),
+                                group_col,
+                            ]
+                            .dropna()
+                            .astype(str)
+                            .unique()
+                            .tolist()
+                        )
+
+                        overtime_subset = df[df[group_col].astype(str).isin(overtime_selected_groups)].copy()
+                        overtime_selection_label = (
+                            f"Cluster: {overtime_selected_cluster} "
+                            f"({len(overtime_selected_groups)} group(s))"
+                        )
+
+            if overtime_subset.empty:
+                st.info("No overtime data is available for the current selection.")
+            else:
+                overtime_subset = overtime_subset.dropna(subset=[COL_OVERTIME]).copy()
+
+                if overtime_subset.empty:
+                    st.info("No valid overtime values are available for the current selection.")
+                else:
+                    st.caption(f"Current selection: **{overtime_selection_label}** · **{len(overtime_subset):,}** row(s)")
+
+                    max_overtime_value = float(pd.to_numeric(df[COL_OVERTIME], errors="coerce").dropna().max())
+                    slider_max = max(1.0, float(np.ceil(max_overtime_value)))
+                    default_threshold = min(20.0, slider_max)
+
+                    high_overtime_threshold = st.slider(
+                        "High overtime threshold",
+                        min_value=0.0,
+                        max_value=slider_max,
+                        value=float(default_threshold),
+                        step=1.0,
+                        help="Used to calculate the share of employees/records at or above this overtime level.",
+                    )
+
+                    overtime_summary = compute_overtime_summary(
+                        overtime_subset,
+                        high_threshold=high_overtime_threshold,
+                    )
+
+                    if overtime_summary is None:
+                        st.info("No overtime summary could be calculated for the current selection.")
+                    else:
+                        c1, c2, c3, c4, c5, c6 = st.columns(6)
+                        c1.metric("Records with overtime", f"{overtime_summary['count']:,}")
+                        c2.metric("Mean overtime", f"{overtime_summary['mean']:.2f}")
+                        c3.metric("Median overtime", f"{overtime_summary['median']:.2f}")
+                        c4.metric("P90 overtime", f"{overtime_summary['p90']:.2f}")
+                        c5.metric("% zero overtime", f"{overtime_summary['pct_zero']:.1f}%")
+                        c6.metric(
+                            f"% ≥ {high_overtime_threshold:.0f}",
+                            f"{overtime_summary['pct_high']:.1f}%",
+                        )
+
+                    st.markdown("### Overtime Distribution")
+                    dist_col1, dist_col2 = st.columns(2)
+
+                    with dist_col1:
+                        overtime_hist = build_histogram(
+                            overtime_subset,
+                            COL_OVERTIME,
+                            COL_OVERTIME,
+                            bins=30,
+                        )
+                        st.altair_chart(overtime_hist, use_container_width=True)
+
+                    with dist_col2:
+                        overtime_band_chart = build_overtime_band_chart(overtime_subset)
+                        st.altair_chart(overtime_band_chart, use_container_width=True)
+
+                    with st.expander("Overtime summary statistics", expanded=False):
+                        overtime_summary_df = summarize_numeric_columns(
+                            overtime_subset,
+                            [COL_OVERTIME],
+                        )
+                        if overtime_summary_df.empty:
+                            st.info("No summary statistics are available.")
+                        else:
+                            st.dataframe(overtime_summary_df.round(2), use_container_width=True)
+
+                    # -------------------------------------------------
+                    # Group-level overtime analysis
+                    # -------------------------------------------------
+                    st.markdown("### Group-Level Overtime Analysis")
+
+                    if overtime_view_mode == "Single Group":
+                        st.caption("A single group is selected, so group-to-group overtime comparisons are not shown.")
+                    else:
+                        group_scope_df = overtime_subset.copy()
+
+                        overtime_group_stats_df = compute_group_overtime_statistics(
+                            group_scope_df,
+                            group_col=group_col,
+                            high_threshold=high_overtime_threshold,
+                        )
+
+                        if overtime_group_stats_df.empty:
+                            st.info("No group-level overtime statistics are available.")
+                        else:
+                            st.dataframe(overtime_group_stats_df.round(2), use_container_width=True)
+
+                            st.download_button(
+                                label="Download group-level overtime statistics (CSV)",
+                                data=overtime_group_stats_df.to_csv(index=False),
+                                file_name="group_level_overtime_statistics.csv",
+                                mime="text/csv",
+                            )
+
+                            chart_col1, chart_col2 = st.columns(2)
+
+                            with chart_col1:
+                                median_chart = build_ranked_overtime_group_chart(
+                                    overtime_group_stats_df,
+                                    group_col=group_col,
+                                    metric_col="overtime_median",
+                                    metric_title="Median Overtime",
+                                    chart_title="Top Groups by Median Overtime",
+                                    top_n=20,
+                                )
+                                st.altair_chart(median_chart, use_container_width=True)
+
+                            with chart_col2:
+                                high_share_chart = build_ranked_overtime_group_chart(
+                                    overtime_group_stats_df,
+                                    group_col=group_col,
+                                    metric_col="pct_high_overtime",
+                                    metric_title=f"% ≥ {high_overtime_threshold:.0f}",
+                                    chart_title="Top Groups by High Overtime Share",
+                                    top_n=20,
+                                )
+                                st.altair_chart(high_share_chart, use_container_width=True)
+
+                            top_groups_for_boxplot = (
+                                overtime_group_stats_df.sort_values("row_count", ascending=False)[group_col]
+                                .dropna()
+                                .astype(str)
+                                .head(12)
+                                .tolist()
+                            )
+
+                            if len(top_groups_for_boxplot) >= 2:
+                                overtime_boxplot = build_overtime_boxplot(
+                                    group_scope_df,
+                                    group_col=group_col,
+                                    top_groups=top_groups_for_boxplot,
+                                    title="Overtime Box Plot for Largest Groups",
+                                )
+                                st.altair_chart(overtime_boxplot, use_container_width=True)
+
+                    # -------------------------------------------------
+                    # Highest-overtime records
+                    # -------------------------------------------------
+                    st.markdown("### Highest Overtime Records")
+
+                    top_n_records = st.slider(
+                        "Number of highest-overtime records to show",
+                        min_value=5,
+                        max_value=100,
+                        value=20,
+                        step=5,
+                        key="top_overtime_records_slider",
+                    )
+
+                    highest_overtime_df = (
+                        overtime_subset[
+                            [
+                                col for col in [
+                                    COL_EMPLOYEE_ID,
+                                    group_col,
+                                    COL_ABSENCE_OCCASIONS,
+                                    COL_DAYS_ABSENT,
+                                    COL_OVERTIME,
+                                ]
+                                if col in overtime_subset.columns
+                            ]
+                        ]
+                        .copy()
+                        .sort_values(by=COL_OVERTIME, ascending=False)
+                        .head(top_n_records)
+                        .reset_index(drop=True)
+                    )
+
+                    st.dataframe(highest_overtime_df, use_container_width=True)
+                    
 # =========================================================
 # Correlations tab
 # =========================================================
