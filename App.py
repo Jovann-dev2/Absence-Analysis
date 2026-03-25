@@ -1503,4 +1503,3 @@ with tab_correlations:
                                     st.info("No correlation matrix could be computed for this cluster.")
                                 else:
                                     st.altair_chart(chart, use_container_width=True)
-``
