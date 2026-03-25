@@ -329,8 +329,12 @@ def build_scatter_chart(
     group_col: str,
     color_field: str | None = None,
     title: str | None = None,
+    show_median_lines: bool = True,
 ) -> alt.Chart:
-    """Create a scatter plot of average absence occasions vs average days absent."""
+    """
+    Create a scatter plot of average absence occasions vs average days absent.
+    Optionally adds median reference lines.
+    """
     cols = [group_col, "avg_absense_occasions", "avg_days_absent", "count"]
     if color_field and color_field not in cols:
         cols.append(color_field)
@@ -340,9 +344,6 @@ def build_scatter_chart(
 
     if plot_df.empty:
         return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_point()
-
-    overall_x = df["avg_absense_occasions"].median(skipna=True)
-    overall_y = df["avg_days_absent"].median(skipna=True)
 
     tooltips = [
         alt.Tooltip(f"{group_col}:N", title="Group"),
@@ -364,10 +365,44 @@ def build_scatter_chart(
         encodings["color"] = alt.Color(f"{color_field}:N", title=color_field)
 
     points = alt.Chart(plot_df).mark_circle(size=90, opacity=0.85).encode(**encodings)
-    vline = alt.Chart(pd.DataFrame({"x": [overall_x]})).mark_rule(color="red", strokeDash=[6, 4]).encode(x="x:Q")
-    hline = alt.Chart(pd.DataFrame({"y": [overall_y]})).mark_rule(color="red", strokeDash=[6, 4]).encode(y="y:Q")
 
-    chart = (points + vline + hline).properties(height=500)
+    layers = [points]
+
+    if show_median_lines:
+        median_x = float(df["avg_absense_occasions"].median(skipna=True))
+        median_y = float(df["avg_days_absent"].median(skipna=True))
+
+        vline_df = pd.DataFrame({"x": [median_x], "label": ["Median Absense Occasions"]})
+        hline_df = pd.DataFrame({"y": [median_y], "label": ["Median Days Absent"]})
+
+        vline = (
+            alt.Chart(vline_df)
+            .mark_rule(color="red", strokeDash=[6, 4], size=2)
+            .encode(
+                x="x:Q",
+                tooltip=[
+                    alt.Tooltip("label:N", title="Reference"),
+                    alt.Tooltip("x:Q", title="Median Absense Occasions", format=".2f"),
+                ],
+            )
+        )
+
+        hline = (
+            alt.Chart(hline_df)
+            .mark_rule(color="red", strokeDash=[6, 4], size=2)
+            .encode(
+                y="y:Q",
+                tooltip=[
+                    alt.Tooltip("label:N", title="Reference"),
+                    alt.Tooltip("y:Q", title="Median Days Absent", format=".2f"),
+                ],
+            )
+        )
+
+        layers.extend([vline, hline])
+
+    chart = alt.layer(*layers).properties(height=500)
+
     if title:
         chart = chart.properties(title=title)
 
@@ -1069,6 +1104,7 @@ with tab_scatter:
             df=agg_df,
             group_col=group_col,
             title="Group Averages",
+            show_median_lines=True,
         )
         st.altair_chart(scatter_chart, use_container_width=True)
 
@@ -1131,12 +1167,14 @@ with tab_clustering:
                     st.altair_chart(sil_chart, use_container_width=True)
 
             st.markdown("### Scatter by Cluster")
+            st.caption("Includes median reference lines for Avg Absense Occasions and Avg Days Absent.")
             cluster_plot_df = mapping_df.copy()
             cluster_chart = build_scatter_chart(
                 df=cluster_plot_df,
                 group_col=group_col,
                 color_field=COL_CLUSTER,
                 title="Clustered Group Averages",
+                show_median_lines=True,
             )
             st.altair_chart(cluster_chart, use_container_width=True)
 
@@ -1465,3 +1503,4 @@ with tab_correlations:
                                     st.info("No correlation matrix could be computed for this cluster.")
                                 else:
                                     st.altair_chart(chart, use_container_width=True)
+``
