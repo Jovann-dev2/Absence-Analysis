@@ -737,7 +737,7 @@ if exclude_unfit and not excluded_values_df.empty:
         st.dataframe(excluded_values_df, width='stretch')
 
 st.subheader("Group Distribution")
-st.bar_chart(group_counts.sort_values())
+st.bar_chart(group_counts.sort_values(by="count", ascending=False))
 st.caption("Record counts per group after applying the selected filters.")
 
 with st.expander("Preview of imported data (PII anonymized)", expanded=False):
