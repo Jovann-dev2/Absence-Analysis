@@ -745,8 +745,14 @@ def build_individual_scatter_chart(
     group_col: str,
     color_field: str | None = None,
     title: str | None = None,
+    show_median_lines: bool = True,
+    median_x: float | None = None,
+    median_y: float | None = None,
 ) -> alt.Chart:
-    """Scatter plot of individual records in a chosen group."""
+    """
+    Scatter plot of individual records in a chosen group.
+    Optionally adds median reference lines for Absense Occasions and Days Absent.
+    """
     plot_df = df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).copy()
 
     if plot_df.empty:
@@ -774,18 +780,66 @@ def build_individual_scatter_chart(
     if color_field and color_field in plot_df.columns:
         encodings["color"] = alt.Color(f"{color_field}:N", title=color_field)
 
-    chart = (
+    points = (
         alt.Chart(plot_df)
         .mark_circle(size=75, opacity=0.8)
         .encode(**encodings)
-        .properties(height=450)
-        .interactive()
     )
+
+    layers = [points]
+
+    if show_median_lines:
+        if median_x is None:
+            median_x = pd.to_numeric(plot_df[COL_ABSENCE_OCCASIONS], errors="coerce").median(skipna=True)
+        if median_y is None:
+            median_y = pd.to_numeric(plot_df[COL_DAYS_ABSENT], errors="coerce").median(skipna=True)
+
+        if pd.notna(median_x):
+            vline_df = pd.DataFrame(
+                {
+                    "x": [float(median_x)],
+                    "label": [f"Median {COL_ABSENCE_OCCASIONS}"],
+                }
+            )
+            vline = (
+                alt.Chart(vline_df)
+                .mark_rule(color="red", strokeDash=[6, 4], size=2)
+                .encode(
+                    x="x:Q",
+                    tooltip=[
+                        alt.Tooltip("label:N", title="Reference"),
+                        alt.Tooltip("x:Q", title=f"Median {COL_ABSENCE_OCCASIONS}", format=".2f"),
+                    ],
+                )
+            )
+            layers.append(vline)
+
+        if pd.notna(median_y):
+            hline_df = pd.DataFrame(
+                {
+                    "y": [float(median_y)],
+                    "label": [f"Median {COL_DAYS_ABSENT}"],
+                }
+            )
+            hline = (
+                alt.Chart(hline_df)
+                .mark_rule(color="red", strokeDash=[6, 4], size=2)
+                .encode(
+                    y="y:Q",
+                    tooltip=[
+                        alt.Tooltip("label:N", title="Reference"),
+                        alt.Tooltip("y:Q", title=f"Median {COL_DAYS_ABSENT}", format=".2f"),
+                    ],
+                )
+            )
+            layers.append(hline)
+
+    chart = alt.layer(*layers).properties(height=450)
 
     if title:
         chart = chart.properties(title=title)
 
-    return chart
+    return chart.interactive()
 
 
 # =========================================================
@@ -1285,17 +1339,40 @@ with tab_distributions:
             # -------------------------------------------------
             if view_mode == "Single Group" and selected_group is not None:
                 st.markdown("### Individual Scatter Plot")
+                st.caption(
+                    "Includes a vertical median line for Absense Occasions and a horizontal median line "
+                    "for Days Absent for the selected group."
+                )
 
                 single_group_df = df[df[group_col].astype(str) == str(selected_group)].copy()
+
+                # Calculate medians once for the selected group and reuse for both plots
+                valid_single_group_df = single_group_df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).copy()
+                median_absense_occasions = (
+                    float(valid_single_group_df[COL_ABSENCE_OCCASIONS].median())
+                    if not valid_single_group_df.empty
+                    else None
+                )
+                median_days_absent = (
+                    float(valid_single_group_df[COL_DAYS_ABSENT].median())
+                    if not valid_single_group_df.empty
+                    else None
+                )
 
                 individual_scatter = build_individual_scatter_chart(
                     single_group_df,
                     group_col=group_col,
                     title=f"Individuals in {selected_group}",
+                    show_median_lines=True,
+                    median_x=median_absense_occasions,
+                    median_y=median_days_absent,
                 )
                 st.altair_chart(individual_scatter, use_container_width=True)
 
                 st.markdown("### Clustered Individual Scatter Plot")
+                st.caption(
+                    "Uses the same selected-group medians as reference lines."
+                )
 
                 if not SKLEARN_AVAILABLE:
                     st.warning("scikit-learn is not available in this environment, so individual clustering cannot be run.")
@@ -1342,6 +1419,9 @@ with tab_distributions:
                                 group_col=group_col,
                                 color_field=COL_INDIVIDUAL_CLUSTER,
                                 title=f"Clustered Individuals in {selected_group}",
+                                show_median_lines=True,
+                                median_x=median_absense_occasions,
+                                median_y=median_days_absent,
                             )
                             st.altair_chart(clustered_scatter, use_container_width=True)
 
