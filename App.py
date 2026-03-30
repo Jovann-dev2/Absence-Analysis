@@ -668,6 +668,8 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Distribution fitting requires scipy.",
             "family": "continuous",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     values = values[np.isfinite(values)]
@@ -677,6 +679,8 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Not enough variation to fit a distribution reliably.",
             "family": "continuous",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     candidates: list[tuple[str, object]] = [
@@ -714,6 +718,8 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Unable to fit the tested continuous distributions.",
             "family": "continuous",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     best = min(fit_results, key=lambda x: x["aic"])
@@ -723,6 +729,8 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
         "best_name": str(best["name"]),
         "meaning": get_distribution_interpretation(str(best["name"])),
         "family": "continuous",
+        "metric_name": "AIC",
+        "metric_value": float(best["aic"]),
     }
 
 
@@ -737,6 +745,8 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Distribution fitting requires scipy.",
             "family": "discrete",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     values = values[np.isfinite(values)]
@@ -746,6 +756,8 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Not enough data to fit a distribution reliably.",
             "family": "discrete",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     values = np.round(values).astype(int)
@@ -756,6 +768,8 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "The data are not suitable for the tested discrete distributions.",
             "family": "discrete",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     fit_results: list[dict[str, object]] = []
@@ -822,6 +836,8 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Unable to fit the tested discrete distributions.",
             "family": "discrete",
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     best = min(fit_results, key=lambda x: x["aic"])
@@ -831,6 +847,8 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
         "best_name": str(best["name"]),
         "meaning": get_distribution_interpretation(str(best["name"])),
         "family": "discrete",
+        "metric_name": "AIC",
+        "metric_value": float(best["aic"]),
     }
 
 
@@ -873,6 +891,8 @@ def fit_best_distribution_for_series(series: pd.Series, column_name: str) -> dic
             "best_name": None,
             "meaning": "No valid numeric values are available.",
             "family": None,
+            "metric_name": "AIC",
+            "metric_value": None,
         }
 
     family = determine_distribution_family(values, column_name)
@@ -894,8 +914,16 @@ def render_best_distribution_summary(subset: pd.DataFrame, value_col: str) -> No
         st.caption("Best-fitting distribution could not be determined reliably for this variable.")
         return
 
+    metric_name = result.get("metric_name")
+    metric_value = result.get("metric_value")
+
+    metric_text = ""
+    if metric_name and metric_value is not None and np.isfinite(metric_value):
+        metric_text = f"  \n**{metric_name}:** {float(metric_value):.2f}"
+
     st.markdown(
-        f"**Best-fitting distribution:** {result['best_name']}  \n"
+        f"**Best-fitting distribution:** {result['best_name']}"
+        f"{metric_text}  \n"
         f"{result['meaning']}"
     )
 
