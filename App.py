@@ -418,6 +418,7 @@ def build_histogram(
 ) -> alt.Chart:
     """Create a histogram for a numeric column."""
     values = pd.to_numeric(df[value_col], errors="coerce").dropna().to_numpy()
+
     if len(values) == 0:
         return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
 
@@ -451,10 +452,11 @@ def build_histogram(
             field=value_col,
             bin=bin_def,
         )
-        .mark_bar(opacity=0.8)
+        .mark_bar(opacity=0.8, binSpacing=1)   # <- tiny gap between bars
         .encode(
             x=alt.X(
                 f"{value_col}_bin_start:Q",
+                bin="binned",                  # <- important
                 title=title,
                 axis=axis_def,
             ),
