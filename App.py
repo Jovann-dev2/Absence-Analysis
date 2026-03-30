@@ -620,20 +620,35 @@ def is_effectively_discrete(values: np.ndarray, tol: float = 1e-9) -> bool:
     return bool(np.all(np.isclose(values, np.round(values), atol=tol)))
 
 
-def safe_sum_log(values: np.ndarray) -> float:
-    """Safely sum log-likelihood terms, returning -inf if any invalid values occur."""
+def compute_discrete_ks_statistic(
+    values: np.ndarray,
+    cdf_callable,
+    *params,
+) -> float:
+    """
+    Compute a KS-style statistic manually for discrete distributions by comparing
+    the empirical CDF with the fitted theoretical CDF on the observed support.
+    """
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
     if len(values) == 0:
-        return -np.inf
-    if np.any(~np.isfinite(values)):
-        return -np.inf
-    return float(np.sum(values))
-
-
-def aic_from_loglik(loglik: float, n_params: int) -> float:
-    """Compute AIC from log-likelihood and number of parameters."""
-    if not np.isfinite(loglik):
         return np.inf
-    return float(2 * n_params - 2 * loglik)
+
+    values = np.sort(values)
+    n = len(values)
+
+    empirical_cdf_right = np.arange(1, n + 1, dtype=float) / n
+    empirical_cdf_left = np.arange(0, n, dtype=float) / n
+
+    theoretical_cdf = np.asarray(cdf_callable(values, *params), dtype=float)
+
+    if theoretical_cdf.shape != values.shape or np.any(~np.isfinite(theoretical_cdf)):
+        return np.inf
+
+    d_plus = np.max(np.abs(empirical_cdf_right - theoretical_cdf))
+    d_minus = np.max(np.abs(theoretical_cdf - empirical_cdf_left))
+    return float(max(d_plus, d_minus))
 
 
 def get_distribution_interpretation(distribution_name: str) -> str:
@@ -659,7 +674,7 @@ def get_distribution_interpretation(distribution_name: str) -> str:
 
 def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
     """
-    Fit several continuous distributions and select the best by AIC.
+    Fit several continuous distributions and select the best by KS statistic.
     Tested: Normal, Lognormal, Gamma, Exponential, Weibull, Logistic
     """
     if not SCIPY_AVAILABLE:
@@ -668,7 +683,7 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Distribution fitting requires scipy.",
             "family": "continuous",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -679,7 +694,7 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Not enough variation to fit a distribution reliably.",
             "family": "continuous",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -697,15 +712,14 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
     for name, dist in candidates:
         try:
             params = dist.fit(values)
-            logpdf = dist.logpdf(values, *params)
-            loglik = safe_sum_log(np.asarray(logpdf, dtype=float))
-            aic = aic_from_loglik(loglik, len(params))
+            ks_result = sps.kstest(values, dist.cdf, args=params)
+            ks_stat = float(ks_result.statistic)
 
-            if np.isfinite(aic):
+            if np.isfinite(ks_stat):
                 fit_results.append(
                     {
                         "name": name,
-                        "aic": aic,
+                        "ks_stat": ks_stat,
                         "params": params,
                     }
                 )
@@ -718,25 +732,25 @@ def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Unable to fit the tested continuous distributions.",
             "family": "continuous",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
-    best = min(fit_results, key=lambda x: x["aic"])
+    best = min(fit_results, key=lambda x: x["ks_stat"])
 
     return {
         "success": True,
         "best_name": str(best["name"]),
         "meaning": get_distribution_interpretation(str(best["name"])),
         "family": "continuous",
-        "metric_name": "AIC",
-        "metric_value": float(best["aic"]),
+        "metric_name": "KS Statistic",
+        "metric_value": float(best["ks_stat"]),
     }
 
 
 def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
     """
-    Fit several discrete distributions and select the best by AIC.
+    Fit several discrete distributions and select the best by KS statistic.
     Tested: Poisson, Negative Binomial, Geometric, Binomial, Discrete Uniform
     """
     if not SCIPY_AVAILABLE:
@@ -745,7 +759,7 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Distribution fitting requires scipy.",
             "family": "discrete",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -756,7 +770,7 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Not enough data to fit a distribution reliably.",
             "family": "discrete",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -768,7 +782,7 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "The data are not suitable for the tested discrete distributions.",
             "family": "discrete",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -778,8 +792,9 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
     try:
         mu = float(np.mean(values))
         if mu > 0:
-            loglik = safe_sum_log(sps.poisson.logpmf(values, mu))
-            fit_results.append({"name": "Poisson", "aic": aic_from_loglik(loglik, 1)})
+            ks_stat = compute_discrete_ks_statistic(values, sps.poisson.cdf, mu)
+            if np.isfinite(ks_stat):
+                fit_results.append({"name": "Poisson", "ks_stat": ks_stat})
     except Exception:
         pass
 
@@ -792,8 +807,9 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             r = (mean_v ** 2) / (var_v - mean_v)
             p = r / (r + mean_v)
             if r > 0 and 0 < p < 1:
-                loglik = safe_sum_log(sps.nbinom.logpmf(values, r, p))
-                fit_results.append({"name": "Negative Binomial", "aic": aic_from_loglik(loglik, 2)})
+                ks_stat = compute_discrete_ks_statistic(values, sps.nbinom.cdf, r, p)
+                if np.isfinite(ks_stat):
+                    fit_results.append({"name": "Negative Binomial", "ks_stat": ks_stat})
     except Exception:
         pass
 
@@ -802,8 +818,9 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
         mean_v = float(np.mean(values))
         p = 1.0 / (mean_v + 1.0) if mean_v >= 0 else np.nan
         if np.isfinite(p) and 0 < p < 1:
-            loglik = safe_sum_log(sps.nbinom.logpmf(values, 1, p))
-            fit_results.append({"name": "Geometric", "aic": aic_from_loglik(loglik, 1)})
+            ks_stat = compute_discrete_ks_statistic(values, sps.nbinom.cdf, 1, p)
+            if np.isfinite(ks_stat):
+                fit_results.append({"name": "Geometric", "ks_stat": ks_stat})
     except Exception:
         pass
 
@@ -814,8 +831,9 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
         if n_trials > 0:
             p = mean_v / n_trials
             if 0 < p < 1:
-                loglik = safe_sum_log(sps.binom.logpmf(values, n_trials, p))
-                fit_results.append({"name": "Binomial", "aic": aic_from_loglik(loglik, 2)})
+                ks_stat = compute_discrete_ks_statistic(values, sps.binom.cdf, n_trials, p)
+                if np.isfinite(ks_stat):
+                    fit_results.append({"name": "Binomial", "ks_stat": ks_stat})
     except Exception:
         pass
 
@@ -825,8 +843,10 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
         vmax = int(np.max(values))
         width = vmax - vmin + 1
         if width > 0:
-            loglik = float(len(values) * (-np.log(width)))
-            fit_results.append({"name": "Discrete Uniform", "aic": aic_from_loglik(loglik, 2)})
+            uniform_dist = sps.randint(vmin, vmax + 1)
+            ks_stat = compute_discrete_ks_statistic(values, uniform_dist.cdf)
+            if np.isfinite(ks_stat):
+                fit_results.append({"name": "Discrete Uniform", "ks_stat": ks_stat})
     except Exception:
         pass
 
@@ -836,19 +856,19 @@ def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
             "best_name": None,
             "meaning": "Unable to fit the tested discrete distributions.",
             "family": "discrete",
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
-    best = min(fit_results, key=lambda x: x["aic"])
+    best = min(fit_results, key=lambda x: x["ks_stat"])
 
     return {
         "success": True,
         "best_name": str(best["name"]),
         "meaning": get_distribution_interpretation(str(best["name"])),
         "family": "discrete",
-        "metric_name": "AIC",
-        "metric_value": float(best["aic"]),
+        "metric_name": "KS Statistic",
+        "metric_value": float(best["ks_stat"]),
     }
 
 
@@ -891,7 +911,7 @@ def fit_best_distribution_for_series(series: pd.Series, column_name: str) -> dic
             "best_name": None,
             "meaning": "No valid numeric values are available.",
             "family": None,
-            "metric_name": "AIC",
+            "metric_name": "KS Statistic",
             "metric_value": None,
         }
 
@@ -919,7 +939,7 @@ def render_best_distribution_summary(subset: pd.DataFrame, value_col: str) -> No
 
     metric_text = ""
     if metric_name and metric_value is not None and np.isfinite(metric_value):
-        metric_text = f"  \n**{metric_name}:** {float(metric_value):.2f}"
+        metric_text = f"  \n**{metric_name}:** {float(metric_value):.4f}"
 
     st.markdown(
         f"**Best-fitting distribution:** {result['best_name']}"
