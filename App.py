@@ -410,8 +410,13 @@ def build_scatter_chart(
 
 
 def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30) -> alt.Chart:
-    """Create a histogram for a numeric column."""
-    values = pd.to_numeric(df[value_col], errors="coerce").dropna().to_numpy()
+    """
+    Create a histogram for a numeric column with one solid bar per interval.
+    The binning is precomputed so Vega-Lite/Altair does not layer shaded sub-bars
+    for distinct values within the same interval.
+    """
+    values = pd.to_numeric(df[value_col], errors="coerce").dropna().to_numpy(dtype=float)
+
     if len(values) == 0:
         return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
 
@@ -420,19 +425,33 @@ def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30
             text="message:N"
         )
 
-    base = alt.Chart(pd.DataFrame({value_col: values}))
+    effective_bins = max(1, min(int(bins), len(np.unique(values))))
+    counts, edges = np.histogram(values, bins=effective_bins)
+
+    plot_df = pd.DataFrame(
+        {
+            "bin_start": edges[:-1],
+            "bin_end": edges[1:],
+            "count": counts,
+        }
+    )
+
+    plot_df = plot_df[plot_df["count"] > 0].copy()
+
+    if plot_df.empty:
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+
     return (
-        base.mark_bar(opacity=0.8)
+        alt.Chart(plot_df)
+        .mark_bar(opacity=0.9, color="#4C78A8")
         .encode(
-            x=alt.X(
-                f"{value_col}:Q",
-                bin=alt.Bin(maxbins=bins),
-                title=title,
-            ),
-            y=alt.Y("count():Q", title="Count"),
+            x=alt.X("bin_start:Q", title=title),
+            x2="bin_end:Q",
+            y=alt.Y("count:Q", title="Count"),
             tooltip=[
-                alt.Tooltip(f"{value_col}:Q", title=title, format=".2f"),
-                alt.Tooltip("count():Q", title="Count"),
+                alt.Tooltip("bin_start:Q", title="Interval Start", format=".2f"),
+                alt.Tooltip("bin_end:Q", title="Interval End", format=".2f"),
+                alt.Tooltip("count:Q", title="Count"),
             ],
         )
         .properties(height=280)
@@ -572,6 +591,8 @@ def summarize_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFr
         result = result.merge(summary, on="metric", how="outer")
 
     return result
+
+
 def compute_overtime_summary(df: pd.DataFrame, high_threshold: float) -> dict[str, float | int] | None:
     """Return key overtime summary metrics for the provided dataframe."""
     if COL_OVERTIME not in df.columns:
@@ -735,7 +756,11 @@ def build_overtime_boxplot(
     top_groups: list[str],
     title: str,
 ) -> alt.Chart:
-    """Build a boxplot of overtime for selected groups."""
+    """
+    Build a boxplot of overtime for selected groups.
+
+    Styled with light outlines so it remains visible on dark backgrounds.
+    """
     if COL_OVERTIME not in df.columns:
         return alt.Chart(pd.DataFrame({"message": ["No overtime column available"]})).mark_text(size=14).encode(
             text="message:N"
@@ -749,7 +774,27 @@ def build_overtime_boxplot(
 
     return (
         alt.Chart(plot_df)
-        .mark_boxplot(size=28)
+        .mark_boxplot(
+            size=28,
+            box={
+                "fill": "#60A5FA",
+                "fillOpacity": 0.22,
+                "stroke": "#E5E7EB",
+                "strokeWidth": 2,
+            },
+            median={
+                "color": "#FBBF24",
+                "strokeWidth": 2.5,
+            },
+            rule={
+                "color": "#E5E7EB",
+                "strokeWidth": 1.5,
+            },
+            ticks={
+                "color": "#E5E7EB",
+                "strokeWidth": 1.5,
+            },
+        )
         .encode(
             x=alt.X(f"{group_col}:N", title=group_col, sort=top_groups),
             y=alt.Y(f"{COL_OVERTIME}:Q", title=COL_OVERTIME),
@@ -760,6 +805,7 @@ def build_overtime_boxplot(
         )
         .properties(height=420, title=title)
     )
+
 
 def run_kmeans_clustering(
     agg_df: pd.DataFrame,
@@ -1650,7 +1696,7 @@ with tab_distributions:
                                     ),
                                     use_container_width=True,
                                 )
-                                
+
 # =========================================================
 # Overtime tab
 # =========================================================
@@ -1910,7 +1956,7 @@ with tab_overtime:
                     )
 
                     st.dataframe(highest_overtime_df, use_container_width=True)
-                    
+
 # =========================================================
 # Correlations tab
 # =========================================================
