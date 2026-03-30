@@ -409,7 +409,14 @@ def build_scatter_chart(
     return chart.interactive()
 
 
-def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30) -> alt.Chart:
+def build_histogram(
+    df: pd.DataFrame,
+    value_col: str,
+    title: str,
+    bins: int = 30,
+    integer_bins: bool = False,
+) -> alt.Chart:
+    """Create a histogram for a numeric column."""
     values = pd.to_numeric(df[value_col], errors="coerce").dropna().to_numpy()
     if len(values) == 0:
         return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
@@ -421,28 +428,42 @@ def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30
 
     hist_df = pd.DataFrame({value_col: values})
 
-    chart = (
+    if integer_bins:
+        bin_def = alt.Bin(step=1)
+        tooltip_fields = [
+            alt.Tooltip(f"{value_col}_bin_start:Q", title=title, format=".0f"),
+            alt.Tooltip("count():Q", title="Count"),
+        ]
+        axis_def = alt.Axis(tickMinStep=1, format=".0f")
+    else:
+        bin_def = alt.Bin(maxbins=bins)
+        tooltip_fields = [
+            alt.Tooltip(f"{value_col}_bin_start:Q", title="Bin start", format=".2f"),
+            alt.Tooltip(f"{value_col}_bin_end:Q", title="Bin end", format=".2f"),
+            alt.Tooltip("count():Q", title="Count"),
+        ]
+        axis_def = alt.Axis()
+
+    return (
         alt.Chart(hist_df)
         .transform_bin(
             as_=[f"{value_col}_bin_start", f"{value_col}_bin_end"],
             field=value_col,
-            bin=alt.Bin(maxbins=bins),
+            bin=bin_def,
         )
         .mark_bar(opacity=0.8)
         .encode(
-            x=alt.X(f"{value_col}_bin_start:Q", title=title),
+            x=alt.X(
+                f"{value_col}_bin_start:Q",
+                title=title,
+                axis=axis_def,
+            ),
             x2=f"{value_col}_bin_end:Q",
             y=alt.Y("count():Q", title="Count"),
-            tooltip=[
-                alt.Tooltip(f"{value_col}_bin_start:Q", title="Bin start", format=".2f"),
-                alt.Tooltip(f"{value_col}_bin_end:Q", title="Bin end", format=".2f"),
-                alt.Tooltip("count():Q", title="Count"),
-            ],
+            tooltip=tooltip_fields,
         )
         .properties(height=280)
     )
-
-    return chart
 
 
 def build_group_distribution_chart(group_counts: pd.Series, group_col: str) -> alt.Chart:
@@ -1509,7 +1530,15 @@ with tab_distributions:
             if COL_DAYS_ABSENT in subset.columns:
                 charts.append(build_histogram(subset, COL_DAYS_ABSENT, COL_DAYS_ABSENT, bins=histogram_bins))
             if COL_ABSENCE_OCCASIONS in subset.columns:
-                charts.append(build_histogram(subset, COL_ABSENCE_OCCASIONS, COL_ABSENCE_OCCASIONS, bins=histogram_bins))
+                charts.append(
+                    build_histogram(
+                        subset,
+                        COL_ABSENCE_OCCASIONS,
+                        COL_ABSENCE_OCCASIONS,
+                        bins=histogram_bins,
+                        integer_bins=True,
+                    )
+                )
             if COL_OVERTIME in subset.columns:
                 charts.append(build_histogram(subset, COL_OVERTIME, COL_OVERTIME, bins=histogram_bins))
 
