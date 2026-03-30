@@ -778,7 +778,11 @@ def build_overtime_boxplot(
 
     return (
         alt.Chart(plot_df)
-        .mark_boxplot(size=28)
+        .mark_boxplot(
+            size=28,
+            color="#6baed6",     # fill color
+            stroke="white"       # outline color
+        )
         .encode(
             x=alt.X(f"{group_col}:N", title=group_col, sort=top_groups),
             y=alt.Y(f"{COL_OVERTIME}:Q", title=COL_OVERTIME),
