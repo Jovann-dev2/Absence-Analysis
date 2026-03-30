@@ -1853,9 +1853,7 @@ with tab_distributions:
                         COL_DAYS_ABSENT,
                         COL_DAYS_ABSENT,
                         bins=histogram_bins,
-                        integer_bins=is_effectively_discrete(
-                            pd.to_numeric(subset[COL_DAYS_ABSENT], errors="coerce").dropna().to_numpy(dtype=float)
-                        ),
+                        integer_bins=False,
                     ),
                     use_container_width=True,
                 )
