@@ -774,14 +774,20 @@ def build_overtime_boxplot(
     plot_df = plot_df.dropna(subset=[COL_OVERTIME])
 
     if plot_df.empty:
-        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
+        return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(
+            text="message:N"
+        )
 
-    return(
+    return (
         alt.Chart(plot_df)
         .mark_boxplot(
             size=28,
             color="#7db7e8",
-            stroke="#f2f2f2"
+            box={"stroke": "#f2f2f2"},
+            median={"stroke": "#f2f2f2"},
+            rule={"stroke": "#f2f2f2"},
+            ticks={"stroke": "#f2f2f2"},
+            outliers={"fill": "#f2f2f2", "stroke": "#f2f2f2"},
         )
         .encode(
             x=alt.X(f"{group_col}:N", title=group_col, sort=top_groups),
