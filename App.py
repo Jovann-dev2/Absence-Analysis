@@ -18,6 +18,13 @@ try:
 except Exception:
     SKLEARN_AVAILABLE = False
 
+try:
+    from scipy import stats as sps
+
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
 
 # =========================================================
 # Page configuration
@@ -452,11 +459,11 @@ def build_histogram(
             field=value_col,
             bin=bin_def,
         )
-        .mark_bar(opacity=0.8, binSpacing=1)   # <- tiny gap between bars
+        .mark_bar(opacity=0.8, binSpacing=1)
         .encode(
             x=alt.X(
                 f"{value_col}_bin_start:Q",
-                bin="binned",                  # <- important
+                bin="binned",
                 title=title,
                 axis=axis_def,
             ),
@@ -601,6 +608,298 @@ def summarize_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFr
         result = result.merge(summary, on="metric", how="outer")
 
     return result
+
+
+# =========================================================
+# Distribution fitting helpers
+# =========================================================
+def is_effectively_discrete(values: np.ndarray, tol: float = 1e-9) -> bool:
+    """Return True if all values are essentially integers."""
+    if len(values) == 0:
+        return False
+    return bool(np.all(np.isclose(values, np.round(values), atol=tol)))
+
+
+def safe_sum_log(values: np.ndarray) -> float:
+    """Safely sum log-likelihood terms, returning -inf if any invalid values occur."""
+    if len(values) == 0:
+        return -np.inf
+    if np.any(~np.isfinite(values)):
+        return -np.inf
+    return float(np.sum(values))
+
+
+def aic_from_loglik(loglik: float, n_params: int) -> float:
+    """Compute AIC from log-likelihood and number of parameters."""
+    if not np.isfinite(loglik):
+        return np.inf
+    return float(2 * n_params - 2 * loglik)
+
+
+def get_distribution_interpretation(distribution_name: str) -> str:
+    """Short interpretation of what the best-fitting distribution may mean."""
+    interpretations = {
+        "Normal": "This suggests the variable is fairly symmetric around a central average, with extreme values becoming less common in both directions.",
+        "Lognormal": "This suggests the variable is right-skewed: most values are relatively low, but there is a longer upper tail with some much larger values.",
+        "Gamma": "This suggests a positive, right-skewed process where values accumulate gradually and higher values occur, but less often.",
+        "Exponential": "This suggests many small values and a rapid drop-off as the variable increases, with no strong central peak beyond the mean scale.",
+        "Weibull": "This suggests a positive skewed variable whose spread and tail behavior are more flexible than a simple exponential pattern.",
+        "Logistic": "This suggests a roughly symmetric variable like a normal distribution, but with somewhat heavier tails and more extreme values.",
+        "Poisson": "This suggests the variable behaves like a count process with events occurring at an approximately steady average rate.",
+        "Negative Binomial": "This suggests a count variable with over-dispersion, meaning variability is higher than a simple Poisson process would expect.",
+        "Geometric": "This suggests the variable is concentrated at low counts, with probabilities dropping off quickly as the count increases.",
+        "Binomial": "This suggests the variable may reflect counts out of a bounded number of opportunities or trials.",
+        "Discrete Uniform": "This suggests the observed counts are spread relatively evenly across the observed integer range, without a strong central concentration.",
+    }
+    return interpretations.get(
+        distribution_name,
+        "This suggests the selected distribution captures the overall shape of the variable better than the alternatives tested.",
+    )
+
+
+def fit_best_continuous_distribution(values: np.ndarray) -> dict[str, object]:
+    """
+    Fit several continuous distributions and select the best by AIC.
+    Tested: Normal, Lognormal, Gamma, Exponential, Weibull, Logistic
+    """
+    if not SCIPY_AVAILABLE:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Distribution fitting requires scipy.",
+            "family": "continuous",
+        }
+
+    values = values[np.isfinite(values)]
+    if len(values) < 8 or np.all(values == values[0]):
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Not enough variation to fit a distribution reliably.",
+            "family": "continuous",
+        }
+
+    candidates: list[tuple[str, object]] = [
+        ("Normal", sps.norm),
+        ("Lognormal", sps.lognorm),
+        ("Gamma", sps.gamma),
+        ("Exponential", sps.expon),
+        ("Weibull", sps.weibull_min),
+        ("Logistic", sps.logistic),
+    ]
+
+    fit_results: list[dict[str, object]] = []
+
+    for name, dist in candidates:
+        try:
+            params = dist.fit(values)
+            logpdf = dist.logpdf(values, *params)
+            loglik = safe_sum_log(np.asarray(logpdf, dtype=float))
+            aic = aic_from_loglik(loglik, len(params))
+
+            if np.isfinite(aic):
+                fit_results.append(
+                    {
+                        "name": name,
+                        "aic": aic,
+                        "params": params,
+                    }
+                )
+        except Exception:
+            continue
+
+    if not fit_results:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Unable to fit the tested continuous distributions.",
+            "family": "continuous",
+        }
+
+    best = min(fit_results, key=lambda x: x["aic"])
+
+    return {
+        "success": True,
+        "best_name": str(best["name"]),
+        "meaning": get_distribution_interpretation(str(best["name"])),
+        "family": "continuous",
+    }
+
+
+def fit_best_discrete_distribution(values: np.ndarray) -> dict[str, object]:
+    """
+    Fit several discrete distributions and select the best by AIC.
+    Tested: Poisson, Negative Binomial, Geometric, Binomial, Discrete Uniform
+    """
+    if not SCIPY_AVAILABLE:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Distribution fitting requires scipy.",
+            "family": "discrete",
+        }
+
+    values = values[np.isfinite(values)]
+    if len(values) < 8:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Not enough data to fit a distribution reliably.",
+            "family": "discrete",
+        }
+
+    values = np.round(values).astype(int)
+
+    if np.any(values < 0) or np.all(values == values[0]):
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "The data are not suitable for the tested discrete distributions.",
+            "family": "discrete",
+        }
+
+    fit_results: list[dict[str, object]] = []
+
+    # Poisson
+    try:
+        mu = float(np.mean(values))
+        if mu > 0:
+            loglik = safe_sum_log(sps.poisson.logpmf(values, mu))
+            fit_results.append({"name": "Poisson", "aic": aic_from_loglik(loglik, 1)})
+    except Exception:
+        pass
+
+    # Negative Binomial (method-of-moments)
+    try:
+        mean_v = float(np.mean(values))
+        var_v = float(np.var(values, ddof=1)) if len(values) > 1 else mean_v
+
+        if mean_v > 0 and var_v > mean_v:
+            r = (mean_v ** 2) / (var_v - mean_v)
+            p = r / (r + mean_v)
+            if r > 0 and 0 < p < 1:
+                loglik = safe_sum_log(sps.nbinom.logpmf(values, r, p))
+                fit_results.append({"name": "Negative Binomial", "aic": aic_from_loglik(loglik, 2)})
+    except Exception:
+        pass
+
+    # Geometric (0-based counts modeled as nbinom with n=1)
+    try:
+        mean_v = float(np.mean(values))
+        p = 1.0 / (mean_v + 1.0) if mean_v >= 0 else np.nan
+        if np.isfinite(p) and 0 < p < 1:
+            loglik = safe_sum_log(sps.nbinom.logpmf(values, 1, p))
+            fit_results.append({"name": "Geometric", "aic": aic_from_loglik(loglik, 1)})
+    except Exception:
+        pass
+
+    # Binomial (upper bound approximated by observed max)
+    try:
+        n_trials = int(np.max(values))
+        mean_v = float(np.mean(values))
+        if n_trials > 0:
+            p = mean_v / n_trials
+            if 0 < p < 1:
+                loglik = safe_sum_log(sps.binom.logpmf(values, n_trials, p))
+                fit_results.append({"name": "Binomial", "aic": aic_from_loglik(loglik, 2)})
+    except Exception:
+        pass
+
+    # Discrete Uniform on observed support
+    try:
+        vmin = int(np.min(values))
+        vmax = int(np.max(values))
+        width = vmax - vmin + 1
+        if width > 0:
+            loglik = float(len(values) * (-np.log(width)))
+            fit_results.append({"name": "Discrete Uniform", "aic": aic_from_loglik(loglik, 2)})
+    except Exception:
+        pass
+
+    if not fit_results:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "Unable to fit the tested discrete distributions.",
+            "family": "discrete",
+        }
+
+    best = min(fit_results, key=lambda x: x["aic"])
+
+    return {
+        "success": True,
+        "best_name": str(best["name"]),
+        "meaning": get_distribution_interpretation(str(best["name"])),
+        "family": "discrete",
+    }
+
+
+def determine_distribution_family(
+    values: np.ndarray,
+    column_name: str,
+) -> str:
+    """
+    Decide whether a variable should be treated as discrete or continuous.
+    Rules:
+    - Overtime is always treated as continuous
+    - Absense Occasions is treated as discrete
+    - Days Absent is treated as discrete only if effectively integer-valued and non-negative
+    - otherwise continuous
+    """
+    if column_name == COL_OVERTIME:
+        return "continuous"
+
+    if column_name == COL_ABSENCE_OCCASIONS:
+        return "discrete"
+
+    if column_name == COL_DAYS_ABSENT:
+        if len(values) > 0 and np.all(values >= 0) and is_effectively_discrete(values):
+            return "discrete"
+        return "continuous"
+
+    if len(values) > 0 and np.all(values >= 0) and is_effectively_discrete(values):
+        return "discrete"
+
+    return "continuous"
+
+
+def fit_best_distribution_for_series(series: pd.Series, column_name: str) -> dict[str, object]:
+    """Fit the best distribution for a numeric series."""
+    values = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
+
+    if len(values) == 0:
+        return {
+            "success": False,
+            "best_name": None,
+            "meaning": "No valid numeric values are available.",
+            "family": None,
+        }
+
+    family = determine_distribution_family(values, column_name)
+
+    if family == "discrete":
+        return fit_best_discrete_distribution(values)
+
+    return fit_best_continuous_distribution(values)
+
+
+def render_best_distribution_summary(subset: pd.DataFrame, value_col: str) -> None:
+    """
+    Render the best-fitting distribution directly under the histogram
+    with a brief explanation of what it may mean.
+    """
+    result = fit_best_distribution_for_series(subset[value_col], value_col)
+
+    if not result["success"] or not result["best_name"]:
+        st.caption("Best-fitting distribution could not be determined reliably for this variable.")
+        return
+
+    st.markdown(
+        f"**Best-fitting distribution:** {result['best_name']}  \n"
+        f"{result['meaning']}"
+    )
+
+
 def compute_overtime_summary(df: pd.DataFrame, high_threshold: float) -> dict[str, float | int] | None:
     """Return key overtime summary metrics for the provided dataframe."""
     if COL_OVERTIME not in df.columns:
@@ -799,6 +1098,7 @@ def build_overtime_boxplot(
         )
         .properties(height=420, title=title)
     )
+
 
 def run_kmeans_clustering(
     agg_df: pd.DataFrame,
@@ -1464,6 +1764,12 @@ with tab_clustering:
 with tab_distributions:
     st.subheader("Distribution Explorer")
 
+    if not SCIPY_AVAILABLE:
+        st.warning(
+            "scipy is not available in this environment. Histograms can still be shown, "
+            "but best-fitting distribution detection requires scipy."
+        )
+
     view_mode = st.radio(
         "View distributions by",
         options=["Single Group", "Cluster"],
@@ -1526,7 +1832,6 @@ with tab_distributions:
     if selected_groups:
         subset = df[df[group_col].astype(str).isin(selected_groups)].copy()
 
-        # Bradford removed from Distribution Explorer charts and summary
         distribution_metric_columns = [
             col for col in [COL_DAYS_ABSENT, COL_ABSENCE_OCCASIONS, COL_OVERTIME]
             if col in subset.columns
@@ -1538,25 +1843,53 @@ with tab_distributions:
         else:
             st.caption(f"Selected rows: **{len(subset):,}**")
 
-            charts: list[alt.Chart] = []
+            st.markdown("### Distributions")
+
+            # Days Absent
             if COL_DAYS_ABSENT in subset.columns:
-                charts.append(build_histogram(subset, COL_DAYS_ABSENT, COL_DAYS_ABSENT, bins=histogram_bins))
+                st.altair_chart(
+                    build_histogram(
+                        subset,
+                        COL_DAYS_ABSENT,
+                        COL_DAYS_ABSENT,
+                        bins=histogram_bins,
+                        integer_bins=is_effectively_discrete(
+                            pd.to_numeric(subset[COL_DAYS_ABSENT], errors="coerce").dropna().to_numpy(dtype=float)
+                        ),
+                    ),
+                    use_container_width=True,
+                )
+                render_best_distribution_summary(subset, COL_DAYS_ABSENT)
+                st.markdown("---")
+
+            # Absense Occasions
             if COL_ABSENCE_OCCASIONS in subset.columns:
-                charts.append(
+                st.altair_chart(
                     build_histogram(
                         subset,
                         COL_ABSENCE_OCCASIONS,
                         COL_ABSENCE_OCCASIONS,
                         bins=histogram_bins,
                         integer_bins=True,
-                    )
+                    ),
+                    use_container_width=True,
                 )
-            if COL_OVERTIME in subset.columns:
-                charts.append(build_histogram(subset, COL_OVERTIME, COL_OVERTIME, bins=histogram_bins))
+                render_best_distribution_summary(subset, COL_ABSENCE_OCCASIONS)
+                st.markdown("---")
 
-            st.markdown("### Distributions")
-            for chart in charts:
-                st.altair_chart(chart, use_container_width=True)
+            # Overtime
+            if COL_OVERTIME in subset.columns:
+                st.altair_chart(
+                    build_histogram(
+                        subset,
+                        COL_OVERTIME,
+                        COL_OVERTIME,
+                        bins=histogram_bins,
+                        integer_bins=False,
+                    ),
+                    use_container_width=True,
+                )
+                render_best_distribution_summary(subset, COL_OVERTIME)
 
             with st.expander("Summary statistics for current selection", expanded=False):
                 summary_df = summarize_numeric_columns(
@@ -1580,7 +1913,6 @@ with tab_distributions:
 
                 single_group_df = df[df[group_col].astype(str) == str(selected_group)].copy()
 
-                # Calculate medians once for the selected group and reuse for both plots
                 valid_single_group_df = single_group_df.dropna(subset=[COL_ABSENCE_OCCASIONS, COL_DAYS_ABSENT]).copy()
                 median_absense_occasions = (
                     float(valid_single_group_df[COL_ABSENCE_OCCASIONS].median())
@@ -1604,9 +1936,7 @@ with tab_distributions:
                 st.altair_chart(individual_scatter, use_container_width=True)
 
                 st.markdown("### Clustered Individual Scatter Plot")
-                st.caption(
-                    "Uses the same selected-group medians as reference lines."
-                )
+                st.caption("Uses the same selected-group medians as reference lines.")
 
                 if not SKLEARN_AVAILABLE:
                     st.warning("scikit-learn is not available in this environment, so individual clustering cannot be run.")
@@ -1697,7 +2027,7 @@ with tab_distributions:
                                     ),
                                     use_container_width=True,
                                 )
-                                
+
 # =========================================================
 # Overtime tab
 # =========================================================
@@ -1957,7 +2287,7 @@ with tab_overtime:
                     )
 
                     st.dataframe(highest_overtime_df, use_container_width=True)
-                    
+
 # =========================================================
 # Correlations tab
 # =========================================================
