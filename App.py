@@ -410,7 +410,6 @@ def build_scatter_chart(
 
 
 def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30) -> alt.Chart:
-    """Create a histogram for a numeric column."""
     values = pd.to_numeric(df[value_col], errors="coerce").dropna().to_numpy()
     if len(values) == 0:
         return alt.Chart(pd.DataFrame({"message": ["No data available"]})).mark_text(size=14).encode(text="message:N")
@@ -420,23 +419,30 @@ def build_histogram(df: pd.DataFrame, value_col: str, title: str, bins: int = 30
             text="message:N"
         )
 
-    base = alt.Chart(pd.DataFrame({value_col: values}))
-    return (
-        base.mark_bar(opacity=0.8)
+    hist_df = pd.DataFrame({value_col: values})
+
+    chart = (
+        alt.Chart(hist_df)
+        .transform_bin(
+            as_=[f"{value_col}_bin_start", f"{value_col}_bin_end"],
+            field=value_col,
+            bin=alt.Bin(maxbins=bins),
+        )
+        .mark_bar(opacity=0.8)
         .encode(
-            x=alt.X(
-                f"{value_col}:Q",
-                bin=alt.Bin(maxbins=bins),
-                title=title,
-            ),
+            x=alt.X(f"{value_col}_bin_start:Q", title=title),
+            x2=f"{value_col}_bin_end:Q",
             y=alt.Y("count():Q", title="Count"),
             tooltip=[
-                alt.Tooltip(f"{value_col}:Q", title=title, format=".2f"),
+                alt.Tooltip(f"{value_col}_bin_start:Q", title="Bin start", format=".2f"),
+                alt.Tooltip(f"{value_col}_bin_end:Q", title="Bin end", format=".2f"),
                 alt.Tooltip("count():Q", title="Count"),
             ],
         )
         .properties(height=280)
     )
+
+    return chart
 
 
 def build_group_distribution_chart(group_counts: pd.Series, group_col: str) -> alt.Chart:
