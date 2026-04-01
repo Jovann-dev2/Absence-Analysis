@@ -1891,8 +1891,9 @@ with tab_distributions:
         else:
             st.caption(f"Selected rows: **{len(subset):,}**")
 
-            st.markdown("### Distributions")
+            st.markdown("### Distributions (Histograms)")
 
+            st.markdown('Histogram of Total Number of Days Absent')
             # Days Absent
             if COL_DAYS_ABSENT in subset.columns:
                 st.altair_chart(
@@ -1908,6 +1909,7 @@ with tab_distributions:
                 render_best_distribution_summary(subset, COL_DAYS_ABSENT)
                 st.markdown("---")
 
+            st.markdown('Histogram of Total Number of Absence Occasions')
             # Absense Occasions
             if COL_ABSENCE_OCCASIONS in subset.columns:
                 st.altair_chart(
@@ -1923,6 +1925,7 @@ with tab_distributions:
                 render_best_distribution_summary(subset, COL_ABSENCE_OCCASIONS)
                 st.markdown("---")
 
+            st.markdown('Histogram of Total Overtime')
             # Overtime
             if COL_OVERTIME in subset.columns:
                 st.altair_chart(
